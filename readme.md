@@ -85,13 +85,6 @@ pip install --no-index --no-cache-dir pytorch3d \
 
 ---
 
-## 2.6 Build Extensions
-
-CMAKE_PREFIX_PATH=$CONDA_PREFIX/lib/python3.9/site-packages/pybind11/share/cmake/pybind11 \
-bash build_all_conda.sh
-
----
-
 # 3. 🚀 Inference
 
 ## 3.1 Environment Variable
