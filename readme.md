@@ -1,4 +1,4 @@
-OneViewAll – Installation & Inference Guide
+OneRefPose – Installation & Inference Guide
 ===========================================
 
 1. Data & Weights Preparation
@@ -23,6 +23,14 @@ mkdir -p weights/2024-01-11-20-02-45
 Prepare demo data:
 mkdir -p demo_data/
 # extract demo data into demo_data/
+
+Download LINEMOD dataset (via HuggingFace):
+pip install -U "huggingface_hub[cli]"
+
+export DATASET_NAME=lm
+huggingface-cli download bop-benchmark/$DATASET_NAME \
+  --local-dir ./${DATASET_NAME}/ \
+  --repo-type=dataset
 
 
 2. Installation (Conda)
@@ -53,13 +61,11 @@ bash build_all_conda.sh
 
 3. Inference
 ------------
-
-# Demo
-python run_demo.py
+ export BOP_DIR=/path/to/lm
 
 # LINEMOD
 python run_linemod.py \
-  --linemod_dir /path/to/LINEMOD \
+  --linemod_dir /path/to/lm \
   --use_reconstructed_mesh 0
 
 # YCB-Video
