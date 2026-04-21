@@ -96,16 +96,14 @@ export BOP_DIR=/path/to/lm
 ## 3.2 LINEMOD
 
 python run_linemod.py \
-  --linemod_dir /path/to/lm \
-  --use_reconstructed_mesh 0
+  --linemod_dir /path/to/lm 
 
 ---
 
 ## 3.3 YCB-Video
 
 python run_ycb_video.py \
-  --ycbv_dir /path/to/YCB_Video \
-  --use_reconstructed_mesh 0
+  --ycbv_dir /path/to/YCB_Video 
 
 ---
 
