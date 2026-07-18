@@ -1,8 +1,5 @@
 # Copyright (c) 2026 [OneViewAll].
 # Licensed under the MIT License.
-#
-# Note: This module is designed to interface with systems licensed under 
-# the NVIDIA Source Code License and maintains non-commercial compatibility.
 
 
 import os,sys,copy,math,tqdm

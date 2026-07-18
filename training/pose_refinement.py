@@ -13,8 +13,8 @@ import time
 import numpy as np
 import torch
 from omegaconf import OmegaConf
-from learning.models.refine_network import RefineNet
-from learning.datasets.h5_dataset import *
+from models.refine_network import RefineNet
+from datasets.h5_dataset import *
 from Utils import *
 from datareader import *
 import torchvision.transforms as T
@@ -336,9 +336,9 @@ class PoseRefinement:
     self.run_name = "2023-10-28-18-33-37"
     model_name = 'model_best.pth'
     code_dir = os.path.dirname(os.path.realpath(__file__))
-    ckpt_dir = f'{code_dir}/../../weights/{self.run_name}/{model_name}'
+    ckpt_dir = f'{code_dir}/../weights/{self.run_name}/{model_name}'
 
-    self.cfg = OmegaConf.load(f'{code_dir}/../../weights/{self.run_name}/config.yml')
+    self.cfg = OmegaConf.load(f'{code_dir}/../weights/{self.run_name}/config.yml')
     self.cfg['ckpt_dir'] = ckpt_dir
     self.cfg['enable_amp'] = True
     self.cfg['batch_size'] = 28
@@ -396,6 +396,7 @@ class PoseRefinement:
     rgb_tensor = torch.as_tensor(rgb, device=device, dtype=torch.float)
     depth_tensor = torch.as_tensor(depth, device=device, dtype=torch.float)
     xyz_map_tensor = torch.as_tensor(xyz_map, device=device, dtype=torch.float)
+    K = torch.as_tensor(K, dtype=torch.float, device=device)
     
     trans_normalizer = self.cfg['trans_normalizer']
     if not isinstance(trans_normalizer, float):
@@ -408,18 +409,15 @@ class PoseRefinement:
     save_path = os.path.join(save_dir, "ref_data.pt")
 
     # Load reference database example
-    data = torch.load(save_path)
-    Ref_xyz_mapA = data["xyz_map"].to(device)
-    Ref_rgb_A = data["rgb"].to(device)
-    Ref_pose = data["pose"].to(device)
-    depth_r = data["depth"].to(device)
+    ref_data = torch.load(save_path)
+    Ref_xyz_mapA = ref_data["xyz_map"].to(device)
+    Ref_rgb_A = ref_data["rgb"].to(device)
+    Ref_pose = ref_data["pose"].to(device)
+    depth_r = ref_data["depth"].to(device)
     
-    obj_meta = data.get("meta", {})
+    obj_meta = ref_data.get("meta", {})
     crop_ratio = obj_meta.get("crop_ratio", self.cfg['crop_ratio'])
 
-    # ==========================================================
-    # 动态对称性检测模块 (Symmetry Check Integration)
-    # ==========================================================
     configs = [
         (True, 0),    # X 轴对称
         (True, 1),    # Y 轴对称
@@ -431,11 +429,9 @@ class PoseRefinement:
     best_sym = False
     best_axis = 0
 
-    debug_root = f"symmetry_check/ob{ob_id}"
-    os.makedirs(debug_root, exist_ok=True)
-    os.makedirs("output_results_2", exist_ok=True)
-
-    # 1. 生成基准视角的坐标图 (is_sym=False) 获取 xyzA0 和 Mask
+    # debug_root = f"symmetry_check/ob{ob_id}"
+    # os.makedirs(debug_root, exist_ok=True)
+    # os.makedirs("output_results_2", exist_ok=True)
     pose_tmp_base = make_project_data_batch_init(
         Ref_pose, Ref_rgb_A, depth_r, Ref_xyz_mapA,
         False, -1,
@@ -493,7 +489,7 @@ class PoseRefinement:
 
     # 3. 选定最优对称性
     # if best_loss > 0.01:
-    if best_loss > 0.26:
+    if best_loss > 0.3:
       is_symmetric = False
       symmetry_axis = -1
     else:

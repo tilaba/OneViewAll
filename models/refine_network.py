@@ -1,8 +1,5 @@
 # Copyright (c) 2026 [OneViewAll].
 # Licensed under the MIT License.
-#
-# Note: This module is designed to interface with systems licensed under 
-# the NVIDIA Source Code License and maintains non-commercial compatibility.
 
 
 import os,sys
@@ -19,7 +16,6 @@ from functools import partial
 from network_modules import *
 from Utils import *
 import time
-
 
 
 class RefineNet(nn.Module):
@@ -76,33 +72,18 @@ class RefineNet(nn.Module):
     bs = len(A)
     output = {}
 
-    # start_time = time.time()
-
     x = torch.cat([A,B], dim=0)
     x = self.encodeA(x)
     a = x[:bs]
     b = x[bs:]
 
-    # end_time = time.time()
-    # print("end_time -start_time", end_time - start_time)
-
-    # start_time0 = time.time()
-
 
     ab = torch.cat((a,b),1).contiguous()
     ab = self.encodeAB(ab)  #(B,C,H,W)
-
-    # end_time0 = time.time()
-    # print("end_time0 -start_time0", end_time0 - start_time0)
-
-    # start_time1 = time.time()
 
     ab = self.pos_embed(ab.reshape(bs, ab.shape[1], -1).permute(0,2,1))
 
     output['trans'] = self.trans_head(ab).mean(dim=1)
     output['rot'] = self.rot_head(ab).mean(dim=1)
-
-    # end_time1 = time.time()
-    # print("end_time1 -start_time1", end_time1 - start_time1)
 
     return output

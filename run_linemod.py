@@ -131,8 +131,8 @@ def run_inference_worker(
     result = NestDict()
 
     for i_frame in i_frames:
-        # if (i_frame > 0):
-        #     break
+        if (i_frame > 0):
+            break
         color = reader.get_color(i_frame)
         depth = reader.get_depth(i_frame)
         ob_mask = get_object_mask(reader, i_frame, ob_id, detect_type)
@@ -221,8 +221,8 @@ def run_pipeline():
     res = NestDict()
 
     # ---------------- objects ----------------
-    # for ob_id in reader_tmp.ob_ids:
-    for ob_id in [10]:      # 测试时可限制物体
+    for ob_id in reader_tmp.ob_ids:
+    # for ob_id in [8]:      # 测试时可限制物体
         error_dict[ob_id] = manager.list()
 
         # ALWAYS use GT mesh (reconstructed removed)
@@ -232,6 +232,7 @@ def run_pipeline():
             mesh.vertices.copy(),
             mesh.vertex_normals.copy(),
             mesh=mesh,
+            ob_id = ob_id
         )
 
         reader = LinemodReader(f"{opt.linemod_dir}/test/{ob_id:06d}")

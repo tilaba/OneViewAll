@@ -7,11 +7,6 @@
 
 import os, sys, time,torch,pickle,trimesh,itertools,pdb,zipfile,datetime,imageio,gzip,logging,joblib,importlib,uuid,signal,multiprocessing,psutil,subprocess,tarfile,scipy,argparse
 from pytorch3d.transforms import so3_log_map,so3_exp_map,se3_exp_map,se3_log_map,matrix_to_axis_angle,matrix_to_euler_angles,euler_angles_to_matrix, rotation_6d_to_matrix
-from pytorch3d.renderer import FoVPerspectiveCameras, PerspectiveCameras, look_at_view_transform, look_at_rotation, RasterizationSettings, MeshRenderer, MeshRasterizer, BlendParams, SoftSilhouetteShader, HardPhongShader, PointLights, TexturesVertex
-from pytorch3d.renderer.mesh.rasterize_meshes import barycentric_coordinates
-from pytorch3d.renderer.mesh.shader import SoftDepthShader, HardFlatShader
-from pytorch3d.renderer.mesh.textures import Textures
-from pytorch3d.structures import Meshes
 from scipy.interpolate import griddata
 import torch.nn.functional as F
 import torchvision
@@ -135,37 +130,6 @@ def sample_views_fibonacci(n_views, radius=1.0):
         cam_in_obs[i, :3, 3] = pos
         
     return cam_in_obs
-
-
-
-def make_mesh_tensors(mesh, device='cuda', max_tex_size=None):
-  mesh_tensors = {}
-  if isinstance(mesh.visual, trimesh.visual.texture.TextureVisuals):
-    img = np.array(mesh.visual.material.image.convert('RGB'))
-    img = img[...,:3]
-    if max_tex_size is not None:
-      max_size = max(img.shape[0], img.shape[1])
-      if max_size>max_tex_size:
-        scale = 1/max_size * max_tex_size
-        img = cv2.resize(img, fx=scale, fy=scale, dsize=None)
-    mesh_tensors['tex'] = torch.as_tensor(img, device=device, dtype=torch.float)[None]/255.0
-    mesh_tensors['uv_idx']  = torch.as_tensor(mesh.faces, device=device, dtype=torch.int)
-    uv = torch.as_tensor(mesh.visual.uv, device=device, dtype=torch.float)
-    uv[:,1] = 1 - uv[:,1]
-    mesh_tensors['uv']  = uv
-  else:
-    if mesh.visual.vertex_colors is None:
-      logging.info(f"WARN: mesh doesn't have vertex_colors, assigning a pure color")
-      mesh.visual.vertex_colors = np.tile(np.array([128,128,128]).reshape(1,3), (len(mesh.vertices), 1))
-    mesh_tensors['vertex_color'] = torch.as_tensor(mesh.visual.vertex_colors[...,:3], device=device, dtype=torch.float)/255.0
-
-  mesh_tensors.update({
-    'pos': torch.tensor(mesh.vertices, device=device, dtype=torch.float),
-    'faces': torch.tensor(mesh.faces, device=device, dtype=torch.int),
-    'vnormals': torch.tensor(mesh.vertex_normals, device=device, dtype=torch.float),
-  })
-  return mesh_tensors
-
 
 def set_seed(random_seed):
   import torch,random
@@ -502,8 +466,6 @@ def random_direction():
   vec /= np.linalg.norm(vec)
   return vec
 
-
-
 def compute_mesh_diameter(model_pts=None, mesh=None, n_sample=1000):
   from sklearn.decomposition import TruncatedSVD
   if mesh is not None:
@@ -520,7 +482,6 @@ def compute_mesh_diameter(model_pts=None, mesh=None, n_sample=1000):
   dists = np.linalg.norm(pts[None]-pts[:,None], axis=-1)
   diameter = dists.max()
   return diameter
-
 
 def compute_crop_window_tf_batch(pts=None, H=None, W=None, poses=None, K=None, crop_ratio=1.2, out_size=None, rgb=None, uvs=None, method='min_box', mesh_diameter=None):
   '''Project the points and find the cropping transform
@@ -555,7 +516,15 @@ def compute_crop_window_tf_batch(pts=None, H=None, W=None, poses=None, K=None, c
                         0,radius,0,
                         0,-radius,0]).reshape(-1,3)
     pts = poses[:,:3,3].reshape(-1,1,3)+offsets.reshape(1,-1,3)
-    K = torch.as_tensor(K)
+    
+    # ==================== 【终极防御防御代码】 ====================
+    # 1. 无论前面的 poses 是 float 还是 double，强制将计算出的 3D 点截断为 float32 并送上 GPU
+    pts = pts.float().cuda()
+    
+    # 2. 无论传入的 K 是 NumPy 还是 double 类型的 Tensor，强制转换为与 pts 相同的 float32 类型和 GPU 设备
+    K = torch.as_tensor(K, dtype=pts.dtype, device=pts.device)
+    # ============================================================
+
     projected = (K@pts.reshape(-1,3).T).T
     uvs = projected[:,:2]/projected[:,2:3]
     uvs = uvs.reshape(B, -1, 2)

@@ -2,15 +2,14 @@
 # Licensed under the MIT License.
 #
 # Note: This module is designed to interface with systems licensed under 
-# the NVIDIA Source Code License and maintains non-commercial compatibility.
 
 from Utils import *
 import numpy as np
 import torch
 import torch.nn as nn
 
-from learning.training.pose_score import PoseScore
-from learning.training.pose_refinement import PoseRefinement
+from training.pose_score import PoseScore
+from training.pose_refinement import PoseRefinement
 
 
 class OneRefPose:
@@ -27,7 +26,7 @@ class OneRefPose:
         self.ignore_normal_flip = True
 
         self._init_object_geometry(model_pts, model_normals, mesh=mesh)
-        self._build_rotation_hypotheses(min_n_views=40, inplane_step=90)
+        self._build_rotation_hypotheses(min_n_views=20, inplane_step=180)
 
         self.scorer = scorer if scorer is not None else PoseScore()
         self.refiner = refiner if refiner is not None else PoseRefinement()
@@ -37,34 +36,39 @@ class OneRefPose:
     # ======================================================
     # Object initialization
     # ======================================================
-    def _init_object_geometry(self, model_pts, model_normals, mesh=None, ob_id=-1):
-        """Initialize object center and diameter."""
-        max_xyz = mesh.vertices.max(axis=0)
-        min_xyz = mesh.vertices.min(axis=0)
 
-        self.model_center = (min_xyz + max_xyz) / 2
+    def _init_object_geometry(self, model_pts, model_normals, mesh=None, ob_id=1):
+        # self.diameter = compute_mesh_diameter(mesh.vertices, n_sample=10000)
+        # print(f"self.diameter {ob_id} ", self.diameter)
+        self.diameter = 0.1
+        save_dir = f"reference_database/linemod_real/{ob_id}/"
+        save_path = os.path.join(save_dir, "ref_data.pt")
+        try:
+            ref_data = torch.load(save_path, map_location='cpu')
+            xyz_map = ref_data["xyz_map"]
+        except:
+            print(f"Warning: Failed to load reference data for ob_id {ob_id}")
+            return
+        if xyz_map.shape[0] == 3:
+            xyz_map = xyz_map.permute(1, 2, 0)
+        valid_mask = xyz_map[..., 2] > 0.001
+        pts = xyz_map[valid_mask].reshape(-1, 3)
+        if pts.numel() == 0:
+            self.diameter = 0.1
+            return
+        mean = pts.mean(dim=0, keepdim=True)
+        std = pts.std(dim=0, keepdim=True)
+        std = torch.clamp(std, min=1e-6)
+        z_scores = torch.abs((pts - mean) / std)
+        filter_mask = (z_scores < 3.0).all(dim=1)
+        pts_filtered = pts[filter_mask]
+        if pts_filtered.numel() < 3:
+            pts_filtered = pts
+        lower = pts_filtered.quantile(0.05, dim=0)
+        upper = pts_filtered.quantile(0.95, dim=0)
+        self.diameter = (upper - lower).norm().item() * 1
+        # print(f"estimate_diameter_from_ref {ob_id}: {self.diameter:.6f} m")
 
-        if mesh is not None:
-            mesh = mesh.copy()
-            mesh.vertices = mesh.vertices - self.model_center.reshape(1, 3)
-
-        self.diameter = compute_mesh_diameter(mesh.vertices, n_sample=10000)
-
-    def load_object_params(self, symmetry_tfs=None, mesh=None, ob_id=-1):
-        """Load cached object parameters."""
-        path = f"reference_database/linemod/{ob_id}/object_params.pt"
-        data = torch.load(path, map_location="cpu")
-
-        self.diameter = data["diameter"]
-        self.model_center = data["model_center"]
-
-    # ======================================================
-    # Coordinate transform
-    # ======================================================
-    def _get_center_transform(self):
-        tf = torch.eye(4, dtype=torch.float, device="cuda")
-        tf[:3, 3] = -torch.as_tensor(self.model_center, device="cuda", dtype=torch.float)
-        return tf
 
     def to_device(self, device="cuda:0"):
         for k in self.__dict__:
@@ -76,6 +80,8 @@ class OneRefPose:
             self.refiner.model.to(device)
         if self.scorer is not None:
             self.scorer.model.to(device)
+
+
 
     # ======================================================
     # Rotation hypothesis generation
@@ -176,11 +182,11 @@ class OneRefPose:
         ids = torch.as_tensor(scores).argsort(descending=True)
 
         poses = torch.as_tensor(poses)[ids]
-        best_pose = poses[0] @ self._get_center_transform()
+        # best_pose = poses[0] @ self._get_center_transform()
 
         self.pose_last = poses[0]
 
-        return best_pose.cpu().numpy()
+        return poses[0].cpu().numpy()
 
     # ======================================================
     # placeholder

@@ -9,7 +9,7 @@ import os,sys,h5py,bisect,io,json
 code_dir = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(f'{code_dir}/../../../../')
 from Utils import *
-from learning.datasets.pose_dataset import *
+from datasets.pose_dataset import *
 
 
 

@@ -17,9 +17,9 @@ from omegaconf import OmegaConf
 from tqdm import tqdm
 code_dir = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(f'{code_dir}/../../../')
-from learning.datasets.h5_dataset import *
-from learning.models.score_network import *
-from learning.datasets.pose_dataset import *
+from datasets.h5_dataset import *
+from models.score_network import *
+from datasets.pose_dataset import *
 from Utils import *
 from datareader import *
 from scipy.spatial.transform import Rotation as R
@@ -388,9 +388,9 @@ class PoseScore:
 
     model_name = 'model_best.pth'
     code_dir = os.path.dirname(os.path.realpath(__file__))
-    ckpt_dir = f'{code_dir}/../../weights/{self.run_name}/{model_name}'
+    ckpt_dir = f'{code_dir}/../weights/{self.run_name}/{model_name}'
 
-    self.cfg = OmegaConf.load(f'{code_dir}/../../weights/{self.run_name}/config.yml')
+    self.cfg = OmegaConf.load(f'{code_dir}/../weights/{self.run_name}/config.yml')
 
     self.cfg['ckpt_dir'] = ckpt_dir
     self.cfg['enable_amp'] = True
@@ -439,6 +439,7 @@ class PoseScore:
     rgb = torch.as_tensor(rgb, device=device, dtype=torch.float)
     depth = torch.as_tensor(depth, device=device, dtype=torch.float)
     render_size = self.cfg['input_resize']
+    K = torch.as_tensor(K, dtype=torch.float, device=device)
 
     save_dir = f"reference_database/linemod_real/{ob_id}"
     save_path = os.path.join(save_dir, "ref_data.pt")
