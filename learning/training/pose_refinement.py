@@ -330,7 +330,7 @@ def make_project_data_batch_init(Ref_pose, rgb_r, depth_r, xyz_map_rs, is_symmet
     return pose_data
 
 
-class PoseRefinePredictor:
+class PoseRefinement:
   def __init__(self,):
     self.amp = True
     self.run_name = "2023-10-28-18-33-37"
@@ -377,6 +377,10 @@ class PoseRefinePredictor:
     @rgb: image (H,W,3)
     @ob_in_cams: initial pose (N,4,4)
     """ 
+    import os
+    import logging
+    import torchvision.utils as vutils
+
     torch.set_default_tensor_type('torch.cuda.FloatTensor')
     tf_to_center = np.eye(4)
     ob_centered_in_cams = ob_in_cams
@@ -384,18 +388,18 @@ class PoseRefinePredictor:
     if not self.cfg.use_normal:
       normal_map = None
 
-    crop_ratio = self.cfg['crop_ratio']
     bs = self.cfg.batch_size
+    device = 'cuda'
 
-    B_in_cams = torch.as_tensor(ob_centered_in_cams, device='cuda', dtype=torch.float)
+    B_in_cams = torch.as_tensor(ob_centered_in_cams, device=device, dtype=torch.float)
 
-    rgb_tensor = torch.as_tensor(rgb, device='cuda', dtype=torch.float)
-    depth_tensor = torch.as_tensor(depth, device='cuda', dtype=torch.float)
-    xyz_map_tensor = torch.as_tensor(xyz_map, device='cuda', dtype=torch.float)
+    rgb_tensor = torch.as_tensor(rgb, device=device, dtype=torch.float)
+    depth_tensor = torch.as_tensor(depth, device=device, dtype=torch.float)
+    xyz_map_tensor = torch.as_tensor(xyz_map, device=device, dtype=torch.float)
     
     trans_normalizer = self.cfg['trans_normalizer']
     if not isinstance(trans_normalizer, float):
-      trans_normalizer = torch.as_tensor(list(trans_normalizer), device='cuda', dtype=torch.float).reshape(1,3) 
+      trans_normalizer = torch.as_tensor(list(trans_normalizer), device=device, dtype=torch.float).reshape(1,3) 
     
     iteration = 3
     render_size = self.cfg['input_resize']
@@ -409,14 +413,108 @@ class PoseRefinePredictor:
     Ref_rgb_A = data["rgb"].to(device)
     Ref_pose = data["pose"].to(device)
     depth_r = data["depth"].to(device)
-    obj_meta = data.get("meta", {})
-    is_symmetric = obj_meta.get("is_symmetric")
-    symmetry_axis = obj_meta.get("symmetry_axis")
-    crop_ratio = obj_meta.get("crop_ratio")
     
+    obj_meta = data.get("meta", {})
+    crop_ratio = obj_meta.get("crop_ratio", self.cfg['crop_ratio'])
+
+    # ==========================================================
+    # 动态对称性检测模块 (Symmetry Check Integration)
+    # ==========================================================
+    configs = [
+        (True, 0),    # X 轴对称
+        (True, 1),    # Y 轴对称
+        (True, 2),    # Z 轴对称
+    ]
+
+    test_pose = Ref_pose.unsqueeze(0)  # [1,4,4]
+    best_loss = float('inf')
+    best_sym = False
+    best_axis = 0
+
+    debug_root = f"symmetry_check/ob{ob_id}"
+    os.makedirs(debug_root, exist_ok=True)
+    os.makedirs("output_results_2", exist_ok=True)
+
+    # 1. 生成基准视角的坐标图 (is_sym=False) 获取 xyzA0 和 Mask
+    pose_tmp_base = make_project_data_batch_init(
+        Ref_pose, Ref_rgb_A, depth_r, Ref_xyz_mapA,
+        False, -1,
+        self.cfg.input_resize, 1,            
+        test_pose, rgb_tensor, depth_tensor, K,
+        crop_ratio=crop_ratio,               
+        xyz_map=xyz_map_tensor,
+        cfg=self.cfg,
+        dataset=self.dataset,
+        mesh_diameter=mesh_diameter,
+        iteration_iter=0,
+        ob_id=ob_id
+    )
+    xyzA0 = pose_tmp_base.xyz_mapAs[0]  # [3, H, W]
+
+    # 根据要求，使用 ref_xyzA0 的前两个通道获取 mask，形状为 [H, W]
+    mask = (xyzA0[:2] > 0).any(dim=0)
+
+    # 2. 遍历可能的对称性轴
+    for is_sym, sym_axis in configs:
+        pose_tmp = make_project_data_batch_init(
+            Ref_pose, Ref_rgb_A, depth_r, Ref_xyz_mapA,
+            is_sym, sym_axis,
+            self.cfg.input_resize, 1,            
+            test_pose, rgb_tensor, depth_tensor, K,
+            crop_ratio=crop_ratio,               
+            xyz_map=xyz_map_tensor,
+            cfg=self.cfg,
+            dataset=self.dataset,
+            mesh_diameter=mesh_diameter,
+            iteration_iter=0,
+            ob_id=ob_id
+        )
+        rgbA = pose_tmp.rgbAs[0]      # [3, H, W] 合成渲染
+        xyzA = pose_tmp.xyz_mapAs[0]  # [3, H, W]
+
+        # 辅助保存图片
+        img = rgbA.detach().float()
+        img = (img - img.min()) / (img.max() - img.min() + 1e-6)
+        # vutils.save_image(img, os.path.join("output_results_2", f"rgbA_{ob_id}_{sym_axis}_{is_sym}.png"))
+        
+        if mask.sum() < 10:
+            loss = 10.0
+        else:
+            # 严格在 mask 区域内计算 L1 误差 (3通道上的总偏差 / 有效像素数)
+            diff = (xyzA - xyzA0).abs().sum() / mask.sum().float()
+            loss = diff.item()
+
+        logging.info(f"Symmetry candidate: is_sym={is_sym}, axis={sym_axis}, loss={loss:.4f}")
+
+        if loss < best_loss:
+            best_loss = loss
+            best_sym = is_sym
+            best_axis = sym_axis
+
+    # 3. 选定最优对称性
+    # if best_loss > 0.01:
+    if best_loss > 0.26:
+      is_symmetric = False
+      symmetry_axis = -1
+    else:
+      is_symmetric = best_sym
+      symmetry_axis = best_axis
+    
+    logging.info(f"ob_id: {ob_id}, Selected symmetry: is_symmetric={is_symmetric}, axis={symmetry_axis} (loss={best_loss:.4f})")
+    # ==========================================================
+
+    # 进入主优化循环，应用刚刚检测出的 is_symmetric 和 symmetry_axis
     for ii in range(iteration):
       # Prepare projected crop data
-      pose_data = make_project_data_batch_init(Ref_pose, Ref_rgb_A, depth_r, Ref_xyz_mapA, is_symmetric, symmetry_axis, self.cfg.input_resize, self.cfg.batch_size, B_in_cams, rgb_tensor, depth_tensor, K, crop_ratio=crop_ratio, xyz_map=xyz_map_tensor, cfg=self.cfg, dataset=self.dataset, mesh_diameter=mesh_diameter, iteration_iter=ii, ob_id=ob_id)
+      pose_data = make_project_data_batch_init(
+          Ref_pose, Ref_rgb_A, depth_r, Ref_xyz_mapA, 
+          is_symmetric, symmetry_axis, 
+          self.cfg.input_resize, self.cfg.batch_size, 
+          B_in_cams, rgb_tensor, depth_tensor, K, 
+          crop_ratio=crop_ratio, xyz_map=xyz_map_tensor, 
+          cfg=self.cfg, dataset=self.dataset, 
+          mesh_diameter=mesh_diameter, iteration_iter=ii, ob_id=ob_id
+      )
       B_in_cams = []
       
       bs = pose_data.rgbAs.shape[0]

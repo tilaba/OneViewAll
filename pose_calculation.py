@@ -9,8 +9,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from learning.training.predict_score import ScorePredictor
-from learning.training.predict_pose_refine import PoseRefinePredictor
+from learning.training.pose_score import PoseScore
+from learning.training.pose_refinement import PoseRefinement
 
 
 class OneRefPose:
@@ -20,17 +20,17 @@ class OneRefPose:
         model_normals,
         symmetry_tfs=None,
         mesh=None,
-        scorer: ScorePredictor = None,
-        refiner: PoseRefinePredictor = None,
+        scorer: PoseScore = None,
+        refiner: PoseRefinement = None,
     ):
         self.gt_pose = None
         self.ignore_normal_flip = True
 
         self._init_object_geometry(model_pts, model_normals, mesh=mesh)
-        self._build_rotation_hypotheses(min_n_views=20, inplane_step=180)
+        self._build_rotation_hypotheses(min_n_views=40, inplane_step=90)
 
-        self.scorer = scorer if scorer is not None else ScorePredictor()
-        self.refiner = refiner if refiner is not None else PoseRefinePredictor()
+        self.scorer = scorer if scorer is not None else PoseScore()
+        self.refiner = refiner if refiner is not None else PoseRefinement()
 
         self.pose_last = None
 
@@ -83,7 +83,7 @@ class OneRefPose:
     def _build_rotation_hypotheses(self, min_n_views=40, inplane_step=60):
         cam_in_obs = sample_views_fibonacci(n_views=min_n_views)
 
-        mask = cam_in_obs[:, 2, 3] >= 0.25 * self.diameter
+        mask = cam_in_obs[:, 2, 3] >= 0.35
         cam_in_obs = cam_in_obs[mask]
 
         rot_grid = []
@@ -99,6 +99,7 @@ class OneRefPose:
             device="cuda",
             dtype=torch.float,
         )
+        logging.info(f"self.rot_grid: {self.rot_grid.shape}")
 
     # ======================================================
     # Pose sampling

@@ -381,7 +381,7 @@ def make_project_data_batch_init(Ref_pose, rgb_r, depth_r, xyz_map_rs, is_symmet
 
 
 
-class ScorePredictor:
+class PoseScore:
   def __init__(self, amp=True):
     self.amp = amp
     self.run_name = "2024-01-11-20-02-45"
@@ -452,6 +452,7 @@ class ScorePredictor:
     obj_meta = data.get("meta", {})
     is_symmetric = obj_meta.get("is_symmetric")
     symmetry_axis = obj_meta.get("symmetry_axis")
+    # symmetry_axis = 2
     crop_ratio = obj_meta.get("crop_ratio")
 
 

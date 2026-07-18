@@ -1,8 +1,4 @@
-# Copyright (c) 2026 [OneViewAll].
-# Licensed under the MIT License.
-#
-# Note: This module is designed to interface with systems licensed under 
-#python run_ycb_video.py  --ycbv_dir /home/yluo/GSPose/dataspace/bop_dataset/ycbv --use_reconstructed_mesh 0\
+# Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
 from Utils import *
 from multiprocessing import Pool
@@ -65,7 +61,7 @@ class PoseEvaluator:
             error = self.add_err(pose_est, pose_gt, model_pts, diameter)
         return error
 
-    def compute_auc(self, errors, max_threshold=0.2, num_steps=1000):
+    def compute_auc(self, errors, max_threshold=1, num_steps=1000):
         thresholds = np.linspace(0, max_threshold, num_steps)
         recalls = np.array([(errors < t).mean() for t in thresholds])
         auc = np.trapz(recalls, thresholds) / max_threshold
@@ -92,7 +88,7 @@ def get_mask(reader, i_frame, ob_id, detect_type):
     return valid
 
 
-def run_pose_estimation_worker(reader, i_frames, est: OneRefPose, debug=False, ob_id=None, device: int = 0, evaluator=None, model_pts=None, error_dict=None):
+def run_pose_estimation_worker(reader, i_frames, est: FoundationPose, debug=False, ob_id=None, device: int = 0, evaluator=None, model_pts=None, error_dict=None):
     result = NestDict()
     torch.cuda.set_device(device)
     est.to_device(f'cuda:{device}')
@@ -117,92 +113,9 @@ def run_pose_estimation_worker(reader, i_frames, est: OneRefPose, debug=False, o
         ob_mask = get_mask(reader, i_frame, ob_id, detect_type=detect_type)
         est.gt_pose = reader.get_gt_pose(i_frame, ob_id)
         pose = est.register(K=reader.K, rgb=color, depth=depth, ob_mask=ob_mask, ob_id=ob_id, iteration=5)
-        logging.info(f"pose:\n{pose}")
 
         error = evaluator.calculate_add_0_1d_success(pose, est.gt_pose, model_pts, ob_id)
         error_dict[ob_id].append(error)
-        logging.info(f"error:\n{error}")
-
-        def draw_3d_bbox(image, pose, K, model_pts, diameter=None, scale_factor=0.95,
-                          color=(0, 255, 0), thickness=2, crop_size=224, crop_scale=1.2):
-            min_xyz = model_pts.min(axis=0)
-            max_xyz = model_pts.max(axis=0)
-            center = (min_xyz + max_xyz) / 2.0
-
-            # 缩放
-            half_size = (max_xyz - min_xyz) / 2.0 * scale_factor
-            min_xyz = center - half_size
-            max_xyz = center + half_size
-
-            if diameter is not None:
-                radius = (diameter / 2) * scale_factor
-                min_xyz = center - radius
-                max_xyz = center + radius
-
-            # 8 个角点
-            bbox_3d = np.array([
-                [min_xyz[0], min_xyz[1], min_xyz[2]],
-                [max_xyz[0], min_xyz[1], min_xyz[2]],
-                [max_xyz[0], max_xyz[1], min_xyz[2]],
-                [min_xyz[0], max_xyz[1], min_xyz[2]],
-                [min_xyz[0], min_xyz[1], max_xyz[2]],
-                [max_xyz[0], min_xyz[1], max_xyz[2]],
-                [max_xyz[0], max_xyz[1], max_xyz[2]],
-                [min_xyz[0], max_xyz[1], max_xyz[2]],
-            ])
-
-            # 相机坐标
-            ones = np.ones((bbox_3d.shape[0], 1))
-            bbox_h = np.hstack([bbox_3d, ones])
-            bbox_cam = (pose @ bbox_h.T).T[:, :3]
-
-            # 投影到 2D
-            pts_2d = (K @ bbox_cam.T).T
-            pts_2d = pts_2d[:, :2] / pts_2d[:, 2:3]
-            pts_2d = pts_2d.astype(int)
-
-            # 画框
-            edges = [
-                (0, 1), (1, 2), (2, 3), (3, 0),  # 底面
-                (4, 5), (5, 6), (6, 7), (7, 4),  # 顶面
-                (0, 4), (1, 5), (2, 6), (3, 7)   # 立柱
-            ]
-            for i, j in edges:
-                cv2.line(image, tuple(pts_2d[i]), tuple(pts_2d[j]), color, thickness)
-
-            # ====== 新增：根据中心和直径比例 crop ======
-            x_min, y_min = pts_2d.min(axis=0)
-            x_max, y_max = pts_2d.max(axis=0)
-
-            cx = (x_min + x_max) / 2
-            cy = (y_min + y_max) / 2
-            box_size = max(x_max - x_min, y_max - y_min) * crop_scale
-
-            x1 = int(cx - box_size / 2)
-            y1 = int(cy - box_size / 2)
-            x2 = int(cx + box_size / 2)
-            y2 = int(cy + box_size / 2)
-
-            # 边界裁剪
-            h, w = image.shape[:2]
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            x2 = min(w, x2)
-            y2 = min(h, y2)
-
-            cropped = image[y1:y2, x1:x2]
-            cropped_resized = cv2.resize(cropped, (crop_size, crop_size))
-            return image
-
-        if (error < 0.05):
-            # 画框
-            image = draw_3d_bbox(color, pose, reader.K, model_pts)
-            save_dir = "error_img"
-            os.makedirs(save_dir, exist_ok=True)
-            filename = f"ob_{ob_id:03d}_i_frame{i_frame:03d}.png"  # ob_005.png
-            save_path = os.path.join(save_dir, filename)
-            cv2.imwrite(save_path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
-            est.to_device(device)
 
         if debug >= 3:
             tmp = est.mesh_ori.copy()
@@ -230,25 +143,21 @@ def run_pose_estimation():
     reader_tmp = YcbVideoReader(video_dirs[0])
     glctx = dr.RasterizeCudaContext()
     mesh_tmp = trimesh.primitives.Box(extents=np.ones((3)), transform=np.eye(4))
-    est = OneRefPose(model_pts=mesh_tmp.vertices.copy(), model_normals=mesh_tmp.vertex_normals.copy(),
+    est = FoundationPose(model_pts=mesh_tmp.vertices.copy(), model_normals=mesh_tmp.vertex_normals.copy(),
                          symmetry_tfs=None, mesh=mesh_tmp, scorer=None, refiner=None, glctx=glctx,
                          debug_dir=debug_dir, debug=debug)
     ob_ids = reader_tmp.ob_ids
 
     for ob_id in ob_ids:
-        #if ob_id != 1:  # TODO: remove this to test all objects
-        #    break
+        # if ob_id != 1:  # TODO: remove this to test all objects
+        #     break
         error_dict[ob_id] = manager.list()
 
         mesh = reader_tmp.get_reconstructed_mesh(ob_id, ref_view_dir=opt.ref_view_dir) if use_reconstructed_mesh else reader_tmp.get_gt_mesh(ob_id)
-
-
         symmetry_tfs = reader_tmp.symmetry_tfs[ob_id]
         est.reset_object(model_pts=mesh.vertices.copy(), model_normals=mesh.vertex_normals.copy(),
                          symmetry_tfs=symmetry_tfs, mesh=mesh)
-        
         model_pts = mesh.vertices.copy()
-
 
         args = []
         for video_dir in video_dirs:

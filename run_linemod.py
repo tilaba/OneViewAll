@@ -12,9 +12,10 @@ import torch
 import trimesh
 from pathlib import Path
 from scipy.spatial import cKDTree
+import multiprocessing
 
 from datareader import *
-from estimater import *
+from pose_calculation import *
 
 
 # =========================================================
@@ -34,11 +35,15 @@ class PoseMetrics:
         for ply in models_dir.glob("obj_*.ply"):
             ob_id = int(ply.stem.split("_")[1])
             mesh = trimesh.load(ply)
+            info = info_json[str(ob_id)]
+
+            # 检查是否存在连续或离散对称性定义
+            has_sym = ('symmetries_continuous' in info) or ('symmetries_discrete' in info)
 
             meta[ob_id] = {
-                "diameter": info_json[str(ob_id)]["diameter"],
-                "symmetry": info_json[str(ob_id)].get("symmetry", "none"),
+                "diameter": info["diameter"],          # 单位：毫米
                 "mesh": mesh,
+                "has_symmetry": has_sym
             }
 
         return meta
@@ -49,20 +54,30 @@ class PoseMetrics:
         return (tf[..., :-1, :-1] @ pts[..., None] + tf[..., :-1, -1:])[..., 0]
 
     def compute_add_error(self, pred, gt, pts, diameter):
+        """标准 ADD 误差（归一化到直径）"""
         pred_pts = self._apply_transform_to_points(pts, pred)
         gt_pts = self._apply_transform_to_points(pts, gt)
         return np.linalg.norm(pred_pts - gt_pts, axis=-1).mean() / diameter
 
     def compute_adds_error(self, pred, gt, pts, diameter):
+        """对称物体的 ADD-S 误差（归一化到直径）"""
         pred_pts = self._apply_transform_to_points(pts, pred)
         gt_pts = self._apply_transform_to_points(pts, gt)
         tree = cKDTree(pred_pts)
         d, _ = tree.query(gt_pts, k=1, workers=-1)
         return d.mean() / diameter
 
-    def compute_add_success_0_1d(self, pred, gt, model_pts, ob_id):
-        diameter = self.meta_data[ob_id]["diameter"] / 1000
-        return self.compute_add_error(pred, gt, model_pts, diameter)
+    def compute_normalized_error(self, pred, gt, model_pts, ob_id):
+        """
+        计算归一化 ADD / ADD-S 误差（除以物体直径），
+        自动根据物体是否具有对称性选择指标。
+        """
+        diameter_m = self.meta_data[ob_id]["diameter"] / 1000.0   # 毫米 -> 米
+        if self.meta_data[ob_id]["has_symmetry"]:
+            error = self.compute_adds_error(pred, gt, model_pts, diameter_m)
+        else:
+            error = self.compute_add_error(pred, gt, model_pts, diameter_m)
+        return error
 
     def compute_pose_decomposition_error(self, pred, gt):
         R1, R2 = pred[:3, :3], gt[:3, :3]
@@ -116,7 +131,8 @@ def run_inference_worker(
     result = NestDict()
 
     for i_frame in i_frames:
-
+        # if (i_frame > 0):
+        #     break
         color = reader.get_color(i_frame)
         depth = reader.get_depth(i_frame)
         ob_mask = get_object_mask(reader, i_frame, ob_id, detect_type)
@@ -137,8 +153,8 @@ def run_inference_worker(
             ob_id=ob_id,
         )
 
-        # ---------------- Error ----------------
-        add_err = metrics.compute_add_success_0_1d(
+        # ---------------- Error (自动选择 ADD 或 ADD-S) ----------------
+        normalized_err = metrics.compute_normalized_error(
             pred_pose, gt_pose, model_pts, ob_id
         )
 
@@ -146,7 +162,7 @@ def run_inference_worker(
             pred_pose, gt_pose
         )
 
-        error_dict[ob_id].append(add_err)
+        error_dict[ob_id].append(normalized_err)
 
         # ---------------- OUTPUT ----------------
         print(f"\n[Frame {i_frame} | Object {ob_id}]")
@@ -154,7 +170,7 @@ def run_inference_worker(
         print("Pred Pose:\n", pred_pose)
 
         print(
-            f"ADD(-S): {add_err:.6f} | "
+            f"ADD(-S): {normalized_err:.6f} | "
             f"Rot: {rot_err:.2f} deg | "
             f"Trans: {trans_err * 1000:.2f} mm"
         )
@@ -206,7 +222,7 @@ def run_pipeline():
 
     # ---------------- objects ----------------
     # for ob_id in reader_tmp.ob_ids:
-    for ob_id in [1]:
+    for ob_id in [10]:      # 测试时可限制物体
         error_dict[ob_id] = manager.list()
 
         # ALWAYS use GT mesh (reconstructed removed)
@@ -238,15 +254,38 @@ def run_pipeline():
 
     # ---------------- final metrics ----------------
     all_errors = []
+    print("\n" + "="*50)
+    print("Per‑object metrics")
+    print("="*50)
+
     for ob_id in error_dict:
-        all_errors.extend(list(error_dict[ob_id]))
+        errors = np.array(list(error_dict[ob_id]))
+        all_errors.extend(errors)
 
+        mean_err = np.mean(errors)
+        median_err = np.median(errors)
+        success_rate = np.mean(errors <= 0.1)
+        auc = compute_auc_sklearn(errors)
+
+        print(f"Object {ob_id:02d}: "
+              f"Mean={mean_err:.6f}  Median={median_err:.6f}  "
+              f"ADD(-S)@0.1d={success_rate:.4f}  AUC@0.1={auc:.4f}")
+
+    # 保存所有误差
+    np.savetxt("all_errors.txt", np.array(all_errors), fmt="%.6f")
+
+    # 整体指标
     all_errors = np.array(all_errors)
+    overall_mean = np.mean(all_errors)
+    overall_median = np.median(all_errors)
+    overall_success = np.mean(all_errors <= 0.1)
+    overall_auc = compute_auc_sklearn(all_errors)
 
-    print("\n========== FINAL METRICS ==========")
-    print("Mean:", np.mean(all_errors))
-    print("Median:", np.median(all_errors))
-    print("ADD@0.1:", np.mean(all_errors <= 0.1))
+    print("\n========== OVERALL METRICS ==========")
+    print(f"Mean:           {overall_mean:.6f}")
+    print(f"Median:         {overall_median:.6f}")
+    print(f"ADD(-S)@0.1d:   {overall_success:.4f}")
+    print(f"AUC@0.1:        {overall_auc:.4f}")
 
 
 # =========================================================
@@ -256,7 +295,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--linemod_dir", type=str)
+    parser.add_argument("--linemod_dir", type=str, required=True)
 
     opt = parser.parse_args()
     set_seed(0)

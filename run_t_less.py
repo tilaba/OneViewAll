@@ -8,7 +8,7 @@ from multiprocessing import Pool
 import multiprocessing
 import json, uuid, joblib, os, sys, argparse
 from datareader import *
-from estimater import *
+from pose_calculation import *
 import matplotlib.pyplot as plt
 from scipy.spatial import cKDTree
 
