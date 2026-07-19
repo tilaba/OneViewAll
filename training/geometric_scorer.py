@@ -4,7 +4,7 @@ import numpy as np
 
 class GeometricScorer:
     def __init__(self, distance_type='point_to_point', sym_tfs=None,
-                 ref_data_dir="reference_database/linemod"):
+                 ref_data_dir="reference_database/linemod_real"):
         """
         已移除所有 ICP 相关的参数设置。
         """
@@ -132,7 +132,7 @@ class GeometricScorer:
         return min_dists
 
     @torch.no_grad()
-    def predict(self, mesh, rgb, depth, K, ob_in_cams, ob_mask,
+    def predict(self, rgb, depth, K, ob_in_cams, ob_mask,
                 normal_map=None, xyz_map=None, mesh_tensors=None,
                 glctx=None, mesh_diameter=None, get_vis=False, ob_id=None):
         

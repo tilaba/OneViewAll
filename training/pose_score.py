@@ -424,7 +424,7 @@ class PoseScore:
 
 
   @torch.inference_mode()
-  def predict(self, rgb, depth, K, ob_in_cams, ob_id, xyz_map=None, mesh_diameter=None):
+  def predict(self, rgb, depth, K, ob_in_cams, ob_mask, ob_id, xyz_map=None, mesh_diameter=None):
     """
     @rgb: np array (H,W,3)
     """
@@ -441,7 +441,7 @@ class PoseScore:
     render_size = self.cfg['input_resize']
     K = torch.as_tensor(K, dtype=torch.float, device=device)
 
-    save_dir = f"reference_database/linemod_real/{ob_id}"
+    save_dir = f"reference_database/linemod/{ob_id}"
     save_path = os.path.join(save_dir, "ref_data.pt")
     data = torch.load(save_path)
 

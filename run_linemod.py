@@ -131,8 +131,8 @@ def run_inference_worker(
     result = NestDict()
 
     for i_frame in i_frames:
-        if (i_frame > 0):
-            break
+        # if (i_frame > 0):
+        #     break
         color = reader.get_color(i_frame)
         depth = reader.get_depth(i_frame)
         ob_mask = get_object_mask(reader, i_frame, ob_id, detect_type)
@@ -208,12 +208,7 @@ def run_pipeline():
     reader_tmp = LinemodReader(f"{opt.linemod_dir}/test/000002")
     metrics = PoseMetrics(opt.linemod_dir)
 
-    mesh_tmp = trimesh.primitives.Box(extents=np.ones(3)).to_mesh()
-
     est = OneRefPose(
-        model_pts=mesh_tmp.vertices.copy(),
-        model_normals=mesh_tmp.vertex_normals.copy(),
-        mesh=mesh_tmp,
         scorer=None,
         refiner=None,
     )
@@ -222,16 +217,14 @@ def run_pipeline():
 
     # ---------------- objects ----------------
     for ob_id in reader_tmp.ob_ids:
-    # for ob_id in [8]:      # 测试时可限制物体
+    # for ob_id in [14]:      # 测试时可限制物体
         error_dict[ob_id] = manager.list()
 
         # ALWAYS use GT mesh (reconstructed removed)
+        #mesh is only used for metric, not for pose estimation
         mesh = reader_tmp.get_gt_mesh(ob_id)
 
         est._init_object_geometry(
-            mesh.vertices.copy(),
-            mesh.vertex_normals.copy(),
-            mesh=mesh,
             ob_id = ob_id
         )
 

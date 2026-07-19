@@ -10,25 +10,26 @@ import torch.nn as nn
 
 from training.pose_score import PoseScore
 from training.pose_refinement import PoseRefinement
+from training.geometric_scorer import GeometricScorer
 
 
 class OneRefPose:
     def __init__(
         self,
-        model_pts,
-        model_normals,
-        symmetry_tfs=None,
-        mesh=None,
         scorer: PoseScore = None,
         refiner: PoseRefinement = None,
     ):
         self.gt_pose = None
         self.ignore_normal_flip = True
 
-        self._init_object_geometry(model_pts, model_normals, mesh=mesh)
+        self._init_object_geometry()
         self._build_rotation_hypotheses(min_n_views=20, inplane_step=180)
 
         self.scorer = scorer if scorer is not None else PoseScore()
+        # self.scorer = GeometricScorer(
+        #   distance_type='point_to_point', sym_tfs=None)
+
+
         self.refiner = refiner if refiner is not None else PoseRefinement()
 
         self.pose_last = None
@@ -37,7 +38,7 @@ class OneRefPose:
     # Object initialization
     # ======================================================
 
-    def _init_object_geometry(self, model_pts, model_normals, mesh=None, ob_id=1):
+    def _init_object_geometry(self, ob_id=1):
         # self.diameter = compute_mesh_diameter(mesh.vertices, n_sample=10000)
         # print(f"self.diameter {ob_id} ", self.diameter)
         self.diameter = 0.1
@@ -174,6 +175,7 @@ class OneRefPose:
             depth=depth,
             K=K,
             ob_in_cams=poses,
+            ob_mask=ob_mask,
             xyz_map=xyz_map,
             mesh_diameter=self.diameter,
             ob_id=ob_id,
