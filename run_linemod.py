@@ -206,7 +206,7 @@ def run_pipeline():
 
     # ---------------- objects ----------------
     # for ob_id in reader_tmp.ob_ids:
-    for ob_id in [1]:
+    for ob_id in [14]:
         error_dict[ob_id] = manager.list()
 
         # ALWAYS use GT mesh (reconstructed removed)

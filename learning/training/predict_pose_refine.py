@@ -400,7 +400,7 @@ class PoseRefinePredictor:
     iteration = 3
     render_size = self.cfg['input_resize']
 
-    save_dir = f"reference_database/linemod_real/{ob_id}"
+    save_dir = f"reference_database/linemod/{ob_id}"
     save_path = os.path.join(save_dir, "ref_data.pt")
 
     # Load reference database example
