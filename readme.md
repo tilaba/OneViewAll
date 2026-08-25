@@ -67,7 +67,7 @@ export CMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH:$CONDA_PREFIX"
 
 ## 2.3 Dependencies
 
-pip install -r requirements.txt
+pip install -r requirement.txt
 
 ---
 

@@ -23,7 +23,7 @@ class OneRefPose:
         self.ignore_normal_flip = True
 
         self._init_object_geometry()
-        self._build_rotation_hypotheses(min_n_views=20, inplane_step=180)
+        self._build_rotation_hypotheses(min_n_views=50, inplane_step=90)
 
         self.scorer = scorer if scorer is not None else PoseScore()
         # self.scorer = GeometricScorer(

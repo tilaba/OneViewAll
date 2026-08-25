@@ -216,8 +216,8 @@ def run_pipeline():
     res = NestDict()
 
     # ---------------- objects ----------------
-    for ob_id in reader_tmp.ob_ids:
-    # for ob_id in [14]:      # 测试时可限制物体
+    # for ob_id in reader_tmp.ob_ids:
+    for ob_id in [14]:      # 测试时可限制物体
         error_dict[ob_id] = manager.list()
 
         # ALWAYS use GT mesh (reconstructed removed)

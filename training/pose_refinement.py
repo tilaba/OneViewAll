@@ -489,7 +489,7 @@ class PoseRefinement:
 
     # 3. 选定最优对称性
     # if best_loss > 0.01:
-    if best_loss > 0.3:
+    if best_loss > 0.1:
       is_symmetric = False
       symmetry_axis = -1
     else:
