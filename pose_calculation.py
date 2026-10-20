@@ -71,7 +71,7 @@ class OneRefPose:
             return {}, False, {}
         data = torch.load(str(pt_path), map_location="cpu")
         meta = data.get("meta", {}) or {}
-        has_tensors = any(k in data for k in ("xyz_map", "rgb", "depth", "pose"))
+        has_tensors = any(k in data for k in ("xyz_map", "rgb", "pose"))
         return meta, has_tensors, data
 
     @staticmethod
@@ -80,15 +80,6 @@ class OneRefPose:
         from PIL import Image
         arr = np.asarray(Image.open(str(path)).convert("RGB"), dtype=np.uint8)  # HWC
         return torch.from_numpy(arr).permute(2, 0, 1).contiguous().float()
-
-    @staticmethod
-    def _read_depth(path: Path) -> torch.Tensor:
-        """Return (H, W) float32."""
-        arr = np.load(str(path))
-        t = torch.from_numpy(arr).float()
-        if t.ndim == 3 and t.shape[0] == 1:
-            t = t[0]
-        return t
 
     @staticmethod
     def _read_xyz(path: Path) -> torch.Tensor:
@@ -107,9 +98,10 @@ class OneRefPose:
     def _load_ref_data(self, save_dir: Path, ob_id: int) -> RefData:
         """
         Load RefData from either:
-          - New layout: ref_data.pt (meta only) + rgb.png / depth.npy /
-            xyz_map.npy / pose.txt
+          - New layout: ref_data.pt (meta only) + rgb.png / xyz_map.npy / pose.txt
           - Legacy layout: ref_data.pt with embedded tensors
+
+        `depth` is not loaded: it is unused by the inference pipeline.
         """
         pt_path = save_dir / "ref_data.pt"
         meta, has_tensors, pt_data = self._load_pt_meta(pt_path)
@@ -117,22 +109,16 @@ class OneRefPose:
         if has_tensors:
             # Legacy path
             rgb = pt_data.get("rgb")
-            depth = pt_data.get("depth")
             xyz_map = pt_data.get("xyz_map")
             pose = pt_data.get("pose", torch.eye(4))
 
-            if not torch.is_tensor(rgb):   rgb = torch.as_tensor(rgb)
-            if not torch.is_tensor(depth): depth = torch.as_tensor(depth)
+            if not torch.is_tensor(rgb):     rgb = torch.as_tensor(rgb)
             if not torch.is_tensor(xyz_map): xyz_map = torch.as_tensor(xyz_map)
-            if not torch.is_tensor(pose):  pose = torch.as_tensor(pose)
+            if not torch.is_tensor(pose):    pose = torch.as_tensor(pose)
 
             rgb = rgb.float()
             if rgb.ndim == 3 and rgb.shape[0] != 3 and rgb.shape[-1] == 3:
                 rgb = rgb.permute(2, 0, 1).contiguous()
-
-            depth = depth.float()
-            if depth.ndim == 3 and depth.shape[0] == 1:
-                depth = depth[0]
 
             xyz_map = xyz_map.float()
             if xyz_map.ndim == 3 and xyz_map.shape[0] != 3 and xyz_map.shape[-1] == 3:
@@ -140,18 +126,16 @@ class OneRefPose:
 
             pose = pose.float().reshape(4, 4)
             return RefData(xyz_map=xyz_map, rgb=rgb, pose=pose,
-                           depth=depth, meta=meta, ob_id=ob_id)
+                           meta=meta, ob_id=ob_id)
 
         # New layout: independent files
         rgb_png = save_dir / "rgb.png"
-        depth_npy = save_dir / "depth.npy"
         xyz_npy = save_dir / "xyz_map.npy"
         pose_txt = save_dir / "pose.txt"
         meta_json = save_dir / "meta.json"
 
         missing = [str(p.name) for p, ok in (
             (rgb_png, rgb_png.is_file()),
-            (depth_npy, depth_npy.is_file()),
             (xyz_npy, xyz_npy.is_file()),
         ) if not ok]
         if missing:
@@ -166,12 +150,11 @@ class OneRefPose:
                 meta = json.load(f)
 
         rgb = self._read_rgb(rgb_png)
-        depth = self._read_depth(depth_npy)
         xyz_map = self._read_xyz(xyz_npy)
         pose = self._read_pose(pose_txt) if pose_txt.is_file() else torch.eye(4)
 
         return RefData(xyz_map=xyz_map, rgb=rgb, pose=pose,
-                       depth=depth, meta=meta, ob_id=ob_id)
+                       meta=meta, ob_id=ob_id)
 
     # ======================================================
     # Object initialization
@@ -202,22 +185,20 @@ class OneRefPose:
         #       filtered out (background pixels are zeroed). This way the
         #       subsequent score / refinement stages and the diameter estimate
         #       operate on the object alone.
-        #       - new layout: computed from save_dir/depth.npy + object mask + ref K
+        #       - new layout: computed from save_dir/xyz_map.npy (or depth.npy + mask)
         #       - legacy layout: ref_data.pt["xyz_map"] (already precomputed and masked)
         #     `_load_ref_data` normalizes it to (3, H, W), so the shape printed
         #     here is (3, H, W).
         #   rgb:    reference RGB, from rgb.png or ref_data.pt["rgb"],
         #           normalized to (3, H, W). Provides color only.
-        #   depth:  reference depth, from depth.npy or ref_data.pt["depth"],
-        #           normalized to (H, W). Used to derive xyz_map.
         #   pose:   reference pose, from pose.txt or ref_data.pt["pose"], (4, 4).
         #   meta:   from ref_data.pt["meta"] (or meta.json), contains crop_ratio etc.
+        #   (depth is not loaded: it is not used by the inference pipeline.)
         # ------------------------------------------------------------------
         r = self.ref_data
         print(f"[RefData] ob_id={ob_id}  "
               f"xyz={tuple(r.xyz_map.shape)}  "
               f"rgb={tuple(r.rgb.shape)}  "
-              f"depth={tuple(r.depth.shape)}  "
               f"pose={tuple(r.pose.shape)}  "
               f"meta={r.meta}")
 
@@ -261,8 +242,7 @@ class OneRefPose:
                 self.ref_data.rgb = self.ref_data.rgb.to(device)
             if torch.is_tensor(self.ref_data.pose):
                 self.ref_data.pose = self.ref_data.pose.to(device)
-            if torch.is_tensor(self.ref_data.depth):
-                self.ref_data.depth = self.ref_data.depth.to(device)
+            # `depth` is unused, no need to move it
 
         if self.refiner is not None:
             self.refiner.model.to(device)

@@ -276,12 +276,19 @@ def process_and_save_pc_data_batched(
     return rgb_res.view(B, H, W, 3), xyz_res.view(B, H, W, 3), Pose_target
 
 @torch.inference_mode()
-def make_project_data_batch_init(Ref_pose, rgb_r, depth_r, xyz_map_rs, is_symmetric, symmetry_axis, render_size, batch_size, ob_in_cams, rgb, depth, K, crop_ratio, xyz_map=None, mesh_diameter=None, cfg=None, dataset:PoseRefinePairH5Dataset=None, iteration_iter = 5, ob_id=None, gt_pose=None):
+def make_project_data_batch_init(Ref_pose, rgb_r, xyz_map_rs, is_symmetric, symmetry_axis,
+                                 render_size, batch_size, ob_in_cams, rgb, depth, K, crop_ratio,
+                                 xyz_map=None, mesh_diameter=None, cfg=None,
+                                 dataset:PoseRefinePairH5Dataset=None, iteration_iter=5,
+                                 ob_id=None, gt_pose=None):
     H, W = depth.shape[:2]
     B = len(ob_in_cams)
     method = 'box_3d'
 
-    tf_to_crops = compute_crop_window_tf_batch(H=H, W=W, poses=ob_in_cams, K=K, crop_ratio=crop_ratio, out_size=(render_size[1], render_size[0]), method=method, mesh_diameter=mesh_diameter)
+    tf_to_crops = compute_crop_window_tf_batch(H=H, W=W, poses=ob_in_cams, K=K,
+                                               crop_ratio=crop_ratio,
+                                               out_size=(render_size[1], render_size[0]),
+                                               method=method, mesh_diameter=mesh_diameter)
 
     poseA = torch.as_tensor(ob_in_cams, dtype=torch.float, device='cuda')
     
@@ -293,7 +300,8 @@ def make_project_data_batch_init(Ref_pose, rgb_r, depth_r, xyz_map_rs, is_symmet
     if K_tensor.ndim == 2:
         K_tensor = K_tensor[None].expand(B, -1, -1)
 
-    bbox2d_crop = torch.as_tensor(np.array([0, 0, cfg['input_resize'][0]-1, cfg['input_resize'][1]-1]).reshape(2,2), device='cuda', dtype=torch.float)
+    bbox2d_crop = torch.as_tensor(np.array([0, 0, cfg['input_resize'][0]-1, cfg['input_resize'][1]-1]).reshape(2,2),
+                                  device='cuda', dtype=torch.float)
     bbox2d_ori = transform_pts(bbox2d_crop, tf_to_crops.inverse()).reshape(-1,4)
     
     if rgb_r.shape[-1] == 3:
@@ -301,12 +309,15 @@ def make_project_data_batch_init(Ref_pose, rgb_r, depth_r, xyz_map_rs, is_symmet
     else:
         rgb_rs = rgb_r
     
-    depth_rs = depth_r.unsqueeze(1)
     Ks = K_tensor
 
     # Warp RGB and XYZ maps to crop window
-    rgbBs = kornia.geometry.transform.warp_perspective(torch.as_tensor(rgb, dtype=torch.float, device='cuda').permute(2,0,1)[None].expand(B,-1,-1,-1), tf_to_crops, dsize=render_size, mode='bilinear', align_corners=False)
-    xyz_mapBs = kornia.geometry.transform.warp_perspective(torch.as_tensor(xyz_map, device='cuda', dtype=torch.float).permute(2,0,1)[None].expand(B,-1,-1,-1), tf_to_crops, dsize=render_size, mode='nearest', align_corners=False)
+    rgbBs = kornia.geometry.transform.warp_perspective(
+        torch.as_tensor(rgb, dtype=torch.float, device='cuda').permute(2,0,1)[None].expand(B,-1,-1,-1),
+        tf_to_crops, dsize=render_size, mode='bilinear', align_corners=False)
+    xyz_mapBs = kornia.geometry.transform.warp_perspective(
+        torch.as_tensor(xyz_map, device='cuda', dtype=torch.float).permute(2,0,1)[None].expand(B,-1,-1,-1),
+        tf_to_crops, dsize=render_size, mode='nearest', align_corners=False)
 
     Ref_xyz_mapA = xyz_map_rs
     Ref_rgb_A = rgb_rs
@@ -318,15 +329,22 @@ def make_project_data_batch_init(Ref_pose, rgb_r, depth_r, xyz_map_rs, is_symmet
     
     # Reprojection for symmetric or non-symmetric objects
     if (is_symmetric):
-      rgb_projA, xyz_projA, updated_poseA = process_and_save_pc_data_batched_v2(symmetry_axis, Ref_xyz_mapA, Ref_rgb_A, xyz_mapBs[0], rgbBs[0], poseA, Ref_pose, K_crop, output_dir="output_results_2")
+      rgb_projA, xyz_projA, updated_poseA = process_and_save_pc_data_batched_v2(
+          symmetry_axis, Ref_xyz_mapA, Ref_rgb_A, xyz_mapBs[0], rgbBs[0],
+          poseA, Ref_pose, K_crop, output_dir="output_results_2")
     else:
-       rgb_projA, xyz_projA, updated_poseA = process_and_save_pc_data_batched(Ref_xyz_mapA, Ref_rgb_A, xyz_mapBs[0], rgbBs[0], poseA, Ref_pose, K_crop, output_dir="output_results_2")
+      rgb_projA, xyz_projA, updated_poseA = process_and_save_pc_data_batched(
+          Ref_xyz_mapA, Ref_rgb_A, xyz_mapBs[0], rgbBs[0],
+          poseA, Ref_pose, K_crop, output_dir="output_results_2")
 
     rgbAs = rgb_projA.permute(0, 3, 1, 2)
     xyz_mapAs = xyz_projA.permute(0, 3, 1, 2)
 
     mesh_diameters = torch.ones((len(rgbAs)), dtype=torch.float, device='cuda')*mesh_diameter
-    pose_data = BatchPoseData(rgbAs=rgbAs, rgbBs=rgbBs, depthAs=None, depthBs=None, normalAs=None, normalBs=None, poseA=poseA, poseB=None, xyz_mapAs=xyz_mapAs, xyz_mapBs=xyz_mapBs, tf_to_crops=tf_to_crops, Ks=Ks, mesh_diameters=mesh_diameters)
+    pose_data = BatchPoseData(rgbAs=rgbAs, rgbBs=rgbBs, depthAs=None, depthBs=None,
+                              normalAs=None, normalBs=None, poseA=poseA, poseB=None,
+                              xyz_mapAs=xyz_mapAs, xyz_mapBs=xyz_mapBs,
+                              tf_to_crops=tf_to_crops, Ks=Ks, mesh_diameters=mesh_diameters)
     pose_data = dataset.transform_batch(batch=pose_data, H_ori=H, W_ori=W, bound=1)
 
     return pose_data
@@ -429,7 +447,6 @@ class PoseRefinement:
     Ref_xyz_mapA = ref_data.xyz_map
     Ref_rgb_A = ref_data.rgb
     Ref_pose = ref_data.pose
-    depth_r = ref_data.depth
     crop_ratio = ref_data.meta.get("crop_ratio", self.cfg['crop_ratio'])
 
     configs = [
@@ -447,7 +464,7 @@ class PoseRefinement:
     # os.makedirs(debug_root, exist_ok=True)
     # os.makedirs("output_results_2", exist_ok=True)
     pose_tmp_base = make_project_data_batch_init(
-        Ref_pose, Ref_rgb_A, depth_r, Ref_xyz_mapA,
+        Ref_pose, Ref_rgb_A, Ref_xyz_mapA,
         False, -1,
         self.cfg.input_resize, 1,            
         test_pose, rgb_tensor, depth_tensor, K,
@@ -467,7 +484,7 @@ class PoseRefinement:
     # 2. Iterate over the candidate symmetry axes
     for is_sym, sym_axis in configs:
         pose_tmp = make_project_data_batch_init(
-            Ref_pose, Ref_rgb_A, depth_r, Ref_xyz_mapA,
+            Ref_pose, Ref_rgb_A, Ref_xyz_mapA,
             is_sym, sym_axis,
             self.cfg.input_resize, 1,            
             test_pose, rgb_tensor, depth_tensor, K,
@@ -518,7 +535,7 @@ class PoseRefinement:
     for ii in range(iteration):
       # Prepare projected crop data
       pose_data = make_project_data_batch_init(
-          Ref_pose, Ref_rgb_A, depth_r, Ref_xyz_mapA, 
+          Ref_pose, Ref_rgb_A, Ref_xyz_mapA, 
           is_symmetric, symmetry_axis, 
           self.cfg.input_resize, self.cfg.batch_size, 
           B_in_cams, rgb_tensor, depth_tensor, K, 
