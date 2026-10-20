@@ -8,11 +8,13 @@
 # copies of the Software.
 
 import functools
-import os,sys,kornia
+import os, sys, kornia
 import time
 import numpy as np
 import torch
 import torch.distributed as dist
+from dataclasses import dataclass
+from typing import Optional
 from omegaconf import OmegaConf
 from tqdm import tqdm
 code_dir = os.path.dirname(os.path.realpath(__file__))
@@ -26,6 +28,39 @@ from scipy.spatial.transform import Rotation as R
 from torchvision.utils import save_image
 from PIL import Image, ImageDraw
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# =========================================================
+# Reference data container
+# =========================================================
+@dataclass
+class RefData:
+    """Bundles all per-object reference data loaded from ref_data.pt."""
+    xyz_map: torch.Tensor
+    rgb: torch.Tensor
+    pose: torch.Tensor
+    depth: torch.Tensor
+    meta: dict
+    ob_id: Optional[int] = None
+
+    @classmethod
+    def from_file(cls, path: str, ob_id: Optional[int] = None) -> "RefData":
+        data = torch.load(path, map_location='cpu')
+        return cls(
+            xyz_map=data["xyz_map"],
+            rgb=data["rgb"],
+            pose=data["pose"],
+            depth=data["depth"],
+            meta=data.get("meta", {}) or {},
+            ob_id=ob_id,
+        )
+
+    def to(self, device) -> "RefData":
+        self.xyz_map = self.xyz_map.to(device)
+        self.rgb = self.rgb.to(device)
+        self.pose = self.pose.to(device)
+        self.depth = self.depth.to(device)
+        return self
 
 
 def vis_batch_data_scores(pose_data, ids, scores, pad_margin=5):
@@ -261,7 +296,7 @@ def process_and_save_pc_data_batched(
     # ----------------------------------------------------
     # ----------------------------------------------------
     xyz_flat = xyz_flat_base.unsqueeze(0).expand(B, -1, -1) # [B, N, 3]
-    # ：X_target = rel_R @ (X_source - t_A) + t_target
+    # Formula: X_target = rel_R @ (X_source - t_A) + t_target
     centered_xyz = xyz_flat - t_A.transpose(1, 2)
     xyz_rot = torch.bmm(centered_xyz, rel_R.transpose(1, 2)) + t_T.transpose(1, 2)
 
@@ -382,8 +417,10 @@ def make_project_data_batch_init(Ref_pose, rgb_r, depth_r, xyz_map_rs, is_symmet
 
 
 class PoseScore:
-  def __init__(self, amp=True):
+  def __init__(self, amp=True, ref_data_root=None):
     self.amp = amp
+    self.ref_data_root = ref_data_root
+    self.ref_data: Optional[RefData] = None
     self.run_name = "2024-01-11-20-02-45"
 
     model_name = 'model_best.pth'
@@ -422,6 +459,22 @@ class PoseScore:
     self.model.cuda().eval()
     #logging.info("init done")
 
+  def set_ref_data(self, ref_data: Optional[RefData]):
+    """Inject per-object reference data (managed by OneRefPose)."""
+    self.ref_data = ref_data
+
+  def _get_ref_data(self, ob_id, device) -> RefData:
+    ref_data = self.ref_data
+    if ref_data is None or (ref_data.ob_id is not None and ref_data.ob_id != ob_id):
+      if self.ref_data_root is None:
+        raise ValueError(
+            f"PoseScore: reference data for ob_id={ob_id} is not set and "
+            "`ref_data_root` is None. Call `set_ref_data()` or pass `ref_data_root`."
+        )
+      save_path = os.path.join(self.ref_data_root, str(ob_id), "ref_data.pt")
+      ref_data = RefData.from_file(save_path, ob_id=ob_id)
+      self.ref_data = ref_data
+    return ref_data.to(device)
 
   @torch.inference_mode()
   def predict(self, rgb, depth, K, ob_in_cams, ob_mask, ob_id, xyz_map=None, mesh_diameter=None):
@@ -441,25 +494,19 @@ class PoseScore:
     render_size = self.cfg['input_resize']
     K = torch.as_tensor(K, dtype=torch.float, device=device)
 
-    save_dir = f"reference_database/linemod_real/{ob_id}"
-    save_path = os.path.join(save_dir, "ref_data.pt")
-    data = torch.load(save_path)
+    ref_data = self._get_ref_data(ob_id, device)
 
-    Ref_xyz_mapA = data["xyz_map"].to(device)
-    Ref_rgb_A = data["rgb"].to(device)
-    Ref_pose = data["pose"].to(device)
-    depth_r = data["depth"].to(device)
+    Ref_xyz_mapA = ref_data.xyz_map
+    Ref_rgb_A = ref_data.rgb
+    Ref_pose = ref_data.pose
+    depth_r = ref_data.depth
 
-    obj_meta = data.get("meta", {})
-    is_symmetric = obj_meta.get("is_symmetric")
-    symmetry_axis = obj_meta.get("symmetry_axis")
-    # symmetry_axis = 2
-    crop_ratio = obj_meta.get("crop_ratio")
+    crop_ratio = ref_data.meta.get("crop_ratio")
 
 
     pose_data = make_project_data_batch_init(
         Ref_pose, Ref_rgb_A, depth_r, Ref_xyz_mapA,
-        is_symmetric, symmetry_axis,
+        ref_data.meta.get("is_symmetric"), ref_data.meta.get("symmetry_axis"),
         render_size, ob_in_cams, rgb, depth, K, crop_ratio, xyz_map,
         mesh_diameter=mesh_diameter,
         cfg=self.cfg, dataset=self.dataset,

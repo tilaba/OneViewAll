@@ -37,11 +37,11 @@ class PoseMetrics:
             mesh = trimesh.load(ply)
             info = info_json[str(ob_id)]
 
-            # 检查是否存在连续或离散对称性定义
+            # Check whether continuous or discrete symmetry is defined
             has_sym = ('symmetries_continuous' in info) or ('symmetries_discrete' in info)
 
             meta[ob_id] = {
-                "diameter": info["diameter"],          # 单位：毫米
+                "diameter": info["diameter"],          # unit: millimeters
                 "mesh": mesh,
                 "has_symmetry": has_sym
             }
@@ -54,13 +54,13 @@ class PoseMetrics:
         return (tf[..., :-1, :-1] @ pts[..., None] + tf[..., :-1, -1:])[..., 0]
 
     def compute_add_error(self, pred, gt, pts, diameter):
-        """标准 ADD 误差（归一化到直径）"""
+        """Standard ADD error (normalized by object diameter)."""
         pred_pts = self._apply_transform_to_points(pts, pred)
         gt_pts = self._apply_transform_to_points(pts, gt)
         return np.linalg.norm(pred_pts - gt_pts, axis=-1).mean() / diameter
 
     def compute_adds_error(self, pred, gt, pts, diameter):
-        """对称物体的 ADD-S 误差（归一化到直径）"""
+        """ADD-S error for symmetric objects (normalized by object diameter)."""
         pred_pts = self._apply_transform_to_points(pts, pred)
         gt_pts = self._apply_transform_to_points(pts, gt)
         tree = cKDTree(pred_pts)
@@ -69,10 +69,11 @@ class PoseMetrics:
 
     def compute_normalized_error(self, pred, gt, model_pts, ob_id):
         """
-        计算归一化 ADD / ADD-S 误差（除以物体直径），
-        自动根据物体是否具有对称性选择指标。
+        Compute normalized ADD / ADD-S error (divided by object diameter),
+        automatically selecting the metric based on whether the object has
+        symmetry.
         """
-        diameter_m = self.meta_data[ob_id]["diameter"] / 1000.0   # 毫米 -> 米
+        diameter_m = self.meta_data[ob_id]["diameter"] / 1000.0   # mm -> m
         if self.meta_data[ob_id]["has_symmetry"]:
             error = self.compute_adds_error(pred, gt, model_pts, diameter_m)
         else:
@@ -153,7 +154,7 @@ def run_inference_worker(
             ob_id=ob_id,
         )
 
-        # ---------------- Error (自动选择 ADD 或 ADD-S) ----------------
+        # ---------------- Error (ADD or ADD-S selected automatically) ----------------
         normalized_err = metrics.compute_normalized_error(
             pred_pose, gt_pose, model_pts, ob_id
         )
@@ -208,25 +209,29 @@ def run_pipeline():
     reader_tmp = LinemodReader(f"{opt.linemod_dir}/test/000002")
     metrics = PoseMetrics(opt.linemod_dir)
 
+    # Note: ob_id is intentionally omitted here. Construction only validates
+    # `ref_data_root` and does NOT load any reference data; the actual loading
+    # happens inside the loop below via _init_object_geometry(ob_id=...).
     est = OneRefPose(
         scorer=None,
         refiner=None,
+        ref_data_root=opt.ref_data_root,
     )
 
     res = NestDict()
 
     # ---------------- objects ----------------
     # for ob_id in reader_tmp.ob_ids:
-    for ob_id in [14]:      # 测试时可限制物体
+    for ob_id in [1]:      # limit objects during testing
         error_dict[ob_id] = manager.list()
 
         # ALWAYS use GT mesh (reconstructed removed)
-        #mesh is only used for metric, not for pose estimation
+        # mesh is only used for metric, not for pose estimation
         mesh = reader_tmp.get_gt_mesh(ob_id)
 
-        est._init_object_geometry(
-            ob_id = ob_id
-        )
+        # Load the RefData for this object, estimate its diameter, and inject
+        # it into scorer / refiner.
+        est._init_object_geometry(ob_id=ob_id)
 
         reader = LinemodReader(f"{opt.linemod_dir}/test/{ob_id:06d}")
 
@@ -265,10 +270,10 @@ def run_pipeline():
               f"Mean={mean_err:.6f}  Median={median_err:.6f}  "
               f"ADD(-S)@0.1d={success_rate:.4f}  AUC@0.1={auc:.4f}")
 
-    # 保存所有误差
+    # Save all errors
     np.savetxt("all_errors.txt", np.array(all_errors), fmt="%.6f")
 
-    # 整体指标
+    # Overall metrics
     all_errors = np.array(all_errors)
     overall_mean = np.mean(all_errors)
     overall_median = np.median(all_errors)
@@ -290,6 +295,13 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--linemod_dir", type=str, required=True)
+    parser.add_argument(
+        "--ref_data_root",
+        type=str,
+        required=True,
+        help="Root dir of reference data: <ref_data_root>/<ob_id>/ref_data.pt. "
+             "Required by OneRefPose to load per-object reference data.",
+    )
 
     opt = parser.parse_args()
     set_seed(0)

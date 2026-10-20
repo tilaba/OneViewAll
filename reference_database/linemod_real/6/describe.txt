@@ -1,0 +1,6 @@
+[RefData] ob_id=6
+  xyz_map: shape=(3, 160, 160), dtype=torch.float32
+  rgb    : shape=(3, 160, 160),    dtype=torch.float32
+  depth  : shape=(1, 160, 160),  dtype=torch.float32
+  pose   : shape=(4, 4)
+  meta   : {'id': 6, 'is_symmetric': True, 'symmetry_axis': 0, 'crop_ratio': 1.15}

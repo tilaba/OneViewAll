@@ -23,6 +23,8 @@ from torchvision.transforms import Resize, Normalize
 import torch.nn.functional as F
 from scipy.spatial.transform import Rotation as R
 
+from training.pose_score import RefData
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def create_mirrored_xyz_map(symmetry_axis, xyz_map, PoseA):
@@ -331,8 +333,10 @@ def make_project_data_batch_init(Ref_pose, rgb_r, depth_r, xyz_map_rs, is_symmet
 
 
 class PoseRefinement:
-  def __init__(self,):
+  def __init__(self, ref_data_root=None):
     self.amp = True
+    self.ref_data_root = ref_data_root
+    self.ref_data: Optional[RefData] = None
     self.run_name = "2023-10-28-18-33-37"
     model_name = 'model_best.pth'
     code_dir = os.path.dirname(os.path.realpath(__file__))
@@ -370,6 +374,23 @@ class PoseRefinement:
     self.last_rot_update = None
     self.cadmodel_cache = None
 
+  def set_ref_data(self, ref_data: Optional[RefData]):
+    """Inject per-object reference data (managed by OneRefPose)."""
+    self.ref_data = ref_data
+
+  def _get_ref_data(self, ob_id, device) -> RefData:
+    ref_data = self.ref_data
+    if ref_data is None or (ref_data.ob_id is not None and ref_data.ob_id != ob_id):
+      if self.ref_data_root is None:
+        raise ValueError(
+            f"PoseRefinement: reference data for ob_id={ob_id} is not set and "
+            "`ref_data_root` is None. Call `set_ref_data()` or pass `ref_data_root`."
+        )
+      save_path = os.path.join(self.ref_data_root, str(ob_id), "ref_data.pt")
+      ref_data = RefData.from_file(save_path, ob_id=ob_id)
+      self.ref_data = ref_data
+    return ref_data.to(device)
+
   @torch.inference_mode()
   def predict(self, rgb, depth, K, ob_in_cams, xyz_map, mesh_diameter=None, iteration=5, ob_id=None):
     """
@@ -377,7 +398,6 @@ class PoseRefinement:
     @rgb: image (H,W,3)
     @ob_in_cams: initial pose (N,4,4)
     """ 
-    import os
     import logging
     import torchvision.utils as vutils
 
@@ -405,23 +425,17 @@ class PoseRefinement:
     iteration = 3
     render_size = self.cfg['input_resize']
 
-    save_dir = f"reference_database/linemod_real/{ob_id}"
-    save_path = os.path.join(save_dir, "ref_data.pt")
-
-    # Load reference database example
-    ref_data = torch.load(save_path)
-    Ref_xyz_mapA = ref_data["xyz_map"].to(device)
-    Ref_rgb_A = ref_data["rgb"].to(device)
-    Ref_pose = ref_data["pose"].to(device)
-    depth_r = ref_data["depth"].to(device)
-    
-    obj_meta = ref_data.get("meta", {})
-    crop_ratio = obj_meta.get("crop_ratio", self.cfg['crop_ratio'])
+    ref_data = self._get_ref_data(ob_id, device)
+    Ref_xyz_mapA = ref_data.xyz_map
+    Ref_rgb_A = ref_data.rgb
+    Ref_pose = ref_data.pose
+    depth_r = ref_data.depth
+    crop_ratio = ref_data.meta.get("crop_ratio", self.cfg['crop_ratio'])
 
     configs = [
-        (True, 0),    # X 轴对称
-        (True, 1),    # Y 轴对称
-        (True, 2),    # Z 轴对称
+        (True, 0),    # Symmetric about the X axis
+        (True, 1),    # Symmetric about the Y axis
+        (True, 2),    # Symmetric about the Z axis
     ]
 
     test_pose = Ref_pose.unsqueeze(0)  # [1,4,4]
@@ -447,10 +461,10 @@ class PoseRefinement:
     )
     xyzA0 = pose_tmp_base.xyz_mapAs[0]  # [3, H, W]
 
-    # 根据要求，使用 ref_xyzA0 的前两个通道获取 mask，形状为 [H, W]
+    # As required, use the first two channels of ref_xyzA0 to obtain a mask of shape [H, W]
     mask = (xyzA0[:2] > 0).any(dim=0)
 
-    # 2. 遍历可能的对称性轴
+    # 2. Iterate over the candidate symmetry axes
     for is_sym, sym_axis in configs:
         pose_tmp = make_project_data_batch_init(
             Ref_pose, Ref_rgb_A, depth_r, Ref_xyz_mapA,
@@ -465,10 +479,10 @@ class PoseRefinement:
             iteration_iter=0,
             ob_id=ob_id
         )
-        rgbA = pose_tmp.rgbAs[0]      # [3, H, W] 合成渲染
+        rgbA = pose_tmp.rgbAs[0]      # [3, H, W] synthesized render
         xyzA = pose_tmp.xyz_mapAs[0]  # [3, H, W]
 
-        # 辅助保存图片
+        # Helper: save the rendered image
         img = rgbA.detach().float()
         img = (img - img.min()) / (img.max() - img.min() + 1e-6)
         # vutils.save_image(img, os.path.join("output_results_2", f"rgbA_{ob_id}_{sym_axis}_{is_sym}.png"))
@@ -476,7 +490,8 @@ class PoseRefinement:
         if mask.sum() < 10:
             loss = 10.0
         else:
-            # 严格在 mask 区域内计算 L1 误差 (3通道上的总偏差 / 有效像素数)
+            # Compute L1 error strictly within the mask region
+            # (total deviation over the 3 channels / number of valid pixels)
             diff = (xyzA - xyzA0).abs().sum() / mask.sum().float()
             loss = diff.item()
 
@@ -487,7 +502,7 @@ class PoseRefinement:
             best_sym = is_sym
             best_axis = sym_axis
 
-    # 3. 选定最优对称性
+    # 3. Select the best symmetry
     # if best_loss > 0.01:
     if best_loss > 0.1:
       is_symmetric = False
@@ -499,7 +514,7 @@ class PoseRefinement:
     logging.info(f"ob_id: {ob_id}, Selected symmetry: is_symmetric={is_symmetric}, axis={symmetry_axis} (loss={best_loss:.4f})")
     # ==========================================================
 
-    # 进入主优化循环，应用刚刚检测出的 is_symmetric 和 symmetry_axis
+    # Enter the main optimization loop, applying the detected is_symmetric / symmetry_axis
     for ii in range(iteration):
       # Prepare projected crop data
       pose_data = make_project_data_batch_init(
