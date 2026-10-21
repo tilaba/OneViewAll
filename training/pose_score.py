@@ -568,3 +568,182 @@ class PoseScore:
 
 
     return scores, None
+
+
+# =========================================================
+# Shared reference loader (legacy + new layout)
+# =========================================================
+def load_ref_data_from_dir(save_dir, ob_id: Optional[int] = None) -> RefData:
+    import json
+    from pathlib import Path
+
+    save_dir = Path(save_dir)
+    pt_path = save_dir / "ref_data.pt"
+    if pt_path.is_file():
+        data = torch.load(str(pt_path), map_location="cpu")
+        if any(k in data for k in ("xyz_map", "rgb", "pose")):
+            rgb = torch.as_tensor(data["rgb"]).float()
+            xyz = torch.as_tensor(data["xyz_map"]).float()
+            if rgb.ndim == 3 and rgb.shape[0] != 3 and rgb.shape[-1] == 3:
+                rgb = rgb.permute(2, 0, 1).contiguous()
+            if xyz.ndim == 3 and xyz.shape[0] != 3 and xyz.shape[-1] == 3:
+                xyz = xyz.permute(2, 0, 1).contiguous()
+            pose = torch.as_tensor(data.get("pose", torch.eye(4))).float().reshape(4, 4)
+            return RefData(xyz_map=xyz, rgb=rgb, pose=pose,
+                           meta=data.get("meta", {}) or {}, ob_id=ob_id)
+
+    rgb_png = save_dir / "rgb.png"
+    xyz_npy = save_dir / "xyz_map.npy"
+    pose_txt = save_dir / "pose.txt"
+    meta_json = save_dir / "meta.json"
+    missing_files = [str(q.name) for q, ok in ((rgb_png, rgb_png.is_file()),
+                                               (xyz_npy, xyz_npy.is_file())) if not ok]
+    if missing_files:
+        raise FileNotFoundError(f"{save_dir}: missing {missing_files}")
+
+    rgb_np = np.asarray(Image.open(str(rgb_png)).convert("RGB"), dtype=np.uint8)
+    rgb = torch.from_numpy(rgb_np).permute(2, 0, 1).contiguous().float()
+
+    xyz_np = np.load(str(xyz_npy))
+    xyz = torch.from_numpy(xyz_np).float()
+    if xyz.ndim == 3 and xyz.shape[-1] == 3:
+        xyz = xyz.permute(2, 0, 1).contiguous()
+
+    pose = (torch.tensor(np.loadtxt(str(pose_txt)), dtype=torch.float32).reshape(4, 4)
+            if pose_txt.is_file() else torch.eye(4))
+
+    meta = {}
+    if meta_json.is_file():
+        with open(meta_json) as f:
+            meta = json.load(f)
+
+    return RefData(xyz_map=xyz, rgb=rgb, pose=pose, meta=meta, ob_id=ob_id)
+
+
+# =========================================================
+# Build RefData from one frame (matches register() depth preprocessing)
+# =========================================================
+def capture_ref_data_from_frame(reader, i_frame, ob_id, K=None,
+                                is_symmetric=False, symmetry_axis=-1,
+                                crop_ratio=1.2, device="cuda",
+                                render_size=(160, 160), mesh_diameter=None,
+                                crop_to_ref=True) -> RefData:
+    """Build RefData from real frame `i_frame`.
+
+    crop_to_ref=True (and mesh_diameter given): warp the reference to the
+    object bbox in its own view at render_size, matching the original
+    CAD-based ref_data.pt layout:
+        - xyz_map: (3, rh, rw) camera-frame points, background zeroed
+        - rgb:     (3, rh, rw)
+        - pose:    true pose of that frame (ob_in_cam, 4x4)
+
+    `Ref_pose` must be the true GT pose: process_and_save_pc_data_batched
+    uses X_obj = R_A^T (X_ref - t_A) with (R_A, t_A) from this pose, so
+    xyz_map and pose must be same-frame.
+    """
+    K = reader.K if K is None else K
+    rgb = reader.get_color(i_frame)
+    depth = reader.get_depth(i_frame)
+    mask = reader.get_mask(i_frame, ob_id)
+    if mask is None:
+        raise RuntimeError(f"frame {i_frame} has no mask for ob_id={ob_id}")
+
+    depth_t = torch.as_tensor(depth, dtype=torch.float)
+    use_cuda = torch.cuda.is_available() and str(device).startswith("cuda")
+    if use_cuda:
+        depth_t = depth_t.to(device)
+        depth_t = erode_depth(depth_t, radius=2, device=device)
+        depth_t = bilateral_filter_depth(depth_t, radius=2, device=device)
+        depth_t = depth_t.cpu()
+
+    depth_np = depth_t.numpy() if torch.is_tensor(depth_t) else np.asarray(depth_t)
+    K_np = K.detach().cpu().numpy() if torch.is_tensor(K) else np.asarray(K)
+
+    xyz = depth2xyzmap(depth_np, K_np)
+    xyz = torch.as_tensor(xyz).float()
+    if xyz.ndim == 3 and xyz.shape[0] == 3:
+        xyz = xyz.permute(1, 2, 0)
+
+    mask_t = torch.as_tensor(np.asarray(mask) > 0)
+    if tuple(mask_t.shape) != tuple(xyz.shape[:2]):
+        raise ValueError(f"mask {tuple(mask_t.shape)} != xyz {tuple(xyz.shape[:2])}")
+    xyz = xyz.clone()
+    xyz[~mask_t] = 0.0
+
+    rgb_t = torch.as_tensor(rgb).float()
+    if rgb_t.ndim == 3 and rgb_t.shape[-1] == 3:
+        rgb_t = rgb_t.permute(2, 0, 1).contiguous()
+
+    pose = torch.as_tensor(reader.get_gt_pose(i_frame, ob_id)).float().reshape(4, 4)
+
+    if crop_to_ref and mesh_diameter is not None:
+        from Utils import compute_crop_window_tf_batch
+        use_cuda = torch.cuda.is_available() and str(device).startswith("cuda")
+        H, W = depth_np.shape[:2]
+
+        # IMPORTANT: `torch.set_default_tensor_type('torch.cuda.FloatTensor')`
+        # may have been called elsewhere (e.g. inside PoseRefinement.predict),
+        # which makes internal torch.zeros(...) inside compute_crop_window_tf_batch
+        # land on cuda. Keep poseA / K on the same device to avoid cuda+cpu mixes.
+        poseA = pose.unsqueeze(0)
+        if use_cuda:
+            poseA = poseA.to(device)
+            K_arg = torch.as_tensor(K_np, dtype=torch.float32, device=device)
+        else:
+            K_arg = torch.as_tensor(K_np, dtype=torch.float32)
+
+        tf = compute_crop_window_tf_batch(
+            H=H, W=W, poses=poseA, K=K_arg,
+            crop_ratio=crop_ratio,
+            out_size=(render_size[1], render_size[0]),
+            method='box_3d', mesh_diameter=mesh_diameter,
+        )
+
+        xyz_chw = xyz.permute(2, 0, 1).contiguous().unsqueeze(0)
+        if use_cuda:
+            tf = tf.to(device)
+            rgb_in = rgb_t.unsqueeze(0).to(device)
+            xyz_in = xyz_chw.to(device)
+        else:
+            rgb_in, xyz_in = rgb_t.unsqueeze(0), xyz_chw
+        import kornia
+        rgb_w = kornia.geometry.transform.warp_perspective(
+            rgb_in, tf, dsize=render_size, mode='bilinear', align_corners=False)
+        xyz_w = kornia.geometry.transform.warp_perspective(
+            xyz_in, tf, dsize=render_size, mode='nearest', align_corners=False)
+        rgb_out = rgb_w[0].cpu()
+        xyz_out = xyz_w[0].cpu()
+    else:
+        rgb_out = rgb_t
+        xyz_out = xyz.permute(2, 0, 1).contiguous()
+
+    meta = {
+        "crop_ratio": float(crop_ratio),
+        "is_symmetric": bool(is_symmetric),
+        "symmetry_axis": int(symmetry_axis),
+        "source_frame": int(i_frame),
+        "ob_id": int(ob_id),
+        "crop_to_ref": bool(crop_to_ref),
+        "depth_preproc": "erode2+bilateral2+depth2xyzmap+mask",
+    }
+    return RefData(xyz_map=xyz_out, rgb=rgb_out, pose=pose, meta=meta, ob_id=ob_id)
+
+
+def _dump_ref_probe(save_dir, Ref_pose, Ref_rgb_A, Ref_xyz_mapA,
+                    rgbAs=None, xyz_mapAs=None, rgbBs=None, xyz_mapBs=None, tag=""):
+    os.makedirs(save_dir, exist_ok=True)
+
+    def _np(t):
+        if t is None:
+            return None
+        if torch.is_tensor(t):
+            return t.detach().cpu().numpy()
+        return np.asarray(t)
+
+    np.save(os.path.join(save_dir, f"Ref_pose{tag}.npy"), _np(Ref_pose))
+    np.save(os.path.join(save_dir, f"Ref_rgb_A{tag}.npy"), _np(Ref_rgb_A))
+    np.save(os.path.join(save_dir, f"Ref_xyz_mapA{tag}.npy"), _np(Ref_xyz_mapA))
+    for name, arr in (("rgbAs", rgbAs), ("xyz_mapAs", xyz_mapAs),
+                      ("rgbBs", rgbBs), ("xyz_mapBs", xyz_mapBs)):
+        if arr is not None:
+            np.save(os.path.join(save_dir, f"{name}{tag}.npy"), _np(arr))

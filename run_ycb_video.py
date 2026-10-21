@@ -1,0 +1,637 @@
+# Copyright (c) 2026 [OneViewAll].
+# Licensed under the MIT License.
+
+from Utils import *
+import os, sys, json, time, argparse, glob
+from pathlib import Path
+import numpy as np
+import torch
+import trimesh
+import yaml
+import cv2
+from scipy.spatial import cKDTree
+from scipy.spatial.transform import Rotation as Rot
+from tqdm import tqdm
+
+from datareader import *
+from pose_calculation import *
+
+DEFAULT_YCB_CLASSES = {
+    "can":     [2, 5, 7, 10],
+    "box":     [3, 4, 8, 9, 61],
+    "bottles": [6, 21],
+    "blocks":  [36, 51, 52],
+    "others":  [11, 19, 24, 25, 35, 37, 40],
+}
+
+
+# =========================================================
+# Pose metrics
+# =========================================================
+class PoseMetrics:
+    def __init__(self, dataset_root, metric="bop"):
+        assert metric in ("bop", "ycbv"), f"Unknown metric: {metric}"
+        self.metric = metric
+        self.meta_data = self._build_dataset_metadata(dataset_root)
+
+    @staticmethod
+    def _has_symmetry(info):
+        for k in ("symmetries", "symmetries_continuous", "symmetries_discrete"):
+            if info.get(k):
+                return True
+        return False
+
+    def _build_dataset_metadata(self, path):
+        meta = {}
+        models_dir = Path(path) / "models"
+        with open(models_dir / "models_info.json") as f:
+            info_json = json.load(f)
+        for ply in models_dir.glob("obj_*.ply"):
+            ob_id = int(ply.stem.split("_")[1])
+            info = info_json[str(ob_id)]
+            meta[ob_id] = {
+                "diameter_mm": info.get("diameter", 200.0),
+                "mesh": trimesh.load(ply),
+                "has_symmetry": self._has_symmetry(info),
+            }
+        return meta
+
+    def _apply(self, pts, tf):
+        if len(tf.shape) >= 3 and tf.shape[-3] != pts.shape[-2]:
+            tf = tf[..., None, :, :]
+        return (tf[..., :-1, :-1] @ pts[..., None] + tf[..., :-1, -1:])[..., 0]
+
+    def add_m(self, pred, gt, pts):
+        p = self._apply(pts, pred)
+        g = self._apply(pts, gt)
+        return float(np.linalg.norm(p - g, axis=-1).mean())
+
+    def adds_m(self, pred, gt, pts):
+        p = self._apply(pts, pred)
+        g = self._apply(pts, gt)
+        d, _ = cKDTree(p).query(g, k=1, workers=-1)
+        return float(d.mean())
+
+    def compute_all_errors(self, pred, gt, model_pts, ob_id):
+        add_m = self.add_m(pred, gt, model_pts)
+        adds_m = self.adds_m(pred, gt, model_pts)
+        
+        diam_m = self.meta_data[ob_id]["diameter_mm"] / 1000.0
+        add_n = add_m / diam_m
+        adds_n = adds_m / diam_m
+        
+        has_sym = self.meta_data[ob_id]["has_symmetry"]
+        selected_n = adds_n if has_sym else add_n
+        selected_name = "ADD-S" if has_sym else "ADD"
+        
+        return {
+            "add_m": add_m, "adds_m": adds_m,
+            "add_n": add_n, "adds_n": adds_n,
+            "selected_n": selected_n, "selected_name": selected_name,
+            "has_symmetry": has_sym,
+        }
+
+    def compute_pose_decomposition_error(self, pred, gt):
+        rot = pred[:3, :3] @ gt[:3, :3].T
+        rot_err = np.linalg.norm(Rot.from_matrix(rot).as_rotvec()) * 180 / np.pi
+        trans_err = np.linalg.norm(pred[:3, 3] - gt[:3, 3])
+        return rot_err, trans_err
+
+
+def compute_auc(errs, max_val=0.1):
+    """
+    Computes Area Under the Accuracy-Threshold Curve (PoseCNN protocol).
+    Mathematically equivalent to trapezoid integration, but O(1) and exact.
+    Formula: AUC = 1/N * sum(1 - min(e_i, T)/T)
+    """
+    errs = np.asarray(errs)
+    if len(errs) == 0:
+        return 0.0
+    
+    # clip errors to max threshold (errors > T contribute 0 to the area)
+    clipped = np.clip(errs, 0, max_val)
+    
+    # normalized area
+    auc = np.mean(1.0 - (clipped / max_val))
+    return float(auc)
+
+
+# =========================================================
+# Mask & Reader Helpers
+# =========================================================
+def get_object_mask(reader, i_frame, ob_id, detect_type):
+    if detect_type == "box":
+        mask = reader.get_mask(i_frame, ob_id, type="mask_visib")
+        if mask is None:
+            return None
+        H, W = mask.shape[:2]
+        vs, us = np.where(mask > 0)
+        if len(vs) == 0:
+            return None
+        valid = np.zeros((H, W), dtype=bool)
+        valid[vs.min():vs.max() + 1, us.min():us.max() + 1] = 1
+        return valid
+    if detect_type == "mask":
+        m = reader.get_mask(i_frame, ob_id, type="mask_visib")
+        return (m > 0) if m is not None else None
+    raise RuntimeError(f"Unknown detect_type: {detect_type}")
+
+
+class _YcbReader:
+    def __init__(self, reader, dataset_dir):
+        self._r = reader
+        self._dataset_dir = str(dataset_dir)
+        self._scene_gt = None
+
+    def __getattr__(self, name):
+        return getattr(self._r, name)
+
+    def _load_scene_gt(self):
+        if self._scene_gt is not None:
+            return self._scene_gt
+        with open(os.path.join(self._dataset_dir, "scene_gt.json")) as f:
+            self._scene_gt = {int(k): v for k, v in json.load(f).items()}
+        return self._scene_gt
+
+    def list_obj_ids(self):
+        gt = self._load_scene_gt()
+        objs = set()
+        for entries in gt.values():
+            for g in entries:
+                objs.add(int(g["obj_id"]))
+        return sorted(objs)
+
+    def frames_for_obj(self, ob_id):
+        gt = self._load_scene_gt()
+        frames = []
+        for k, entries in gt.items():
+            for g in entries:
+                if int(g["obj_id"]) == int(ob_id):
+                    frames.append(k)
+                    break
+        return sorted(frames)
+
+    def get_instance_ids_in_image(self, k):
+        gt = self._load_scene_gt()
+        if k not in gt:
+            return []
+        return [int(g["obj_id"]) for g in gt[k]]
+
+    def get_mask(self, i_frame, ob_id, type="mask_visib", **kwargs):
+        gt = self._load_scene_gt()
+        if i_frame not in gt:
+            return None
+        gt_idx = None
+        for idx, g in enumerate(gt[i_frame]):
+            if int(g["obj_id"]) == int(ob_id):
+                gt_idx = idx
+                break
+        if gt_idx is None:
+            return None
+        mask_path = os.path.join(self._dataset_dir, type, f"{i_frame:06d}_{gt_idx:06d}.png")
+        if not os.path.isfile(mask_path):
+            return None
+        return cv2.imread(mask_path, -1)
+
+
+def _reader_ob_ids(reader):
+    try:
+        return list(reader.ob_ids)
+    except (AttributeError, TypeError):
+        return []
+
+
+def _discover_video_dirs(ycbv_dir):
+    return sorted(glob.glob(f"{ycbv_dir}/test/*"))
+
+
+def _get_reader(ycbv_dir, v_idx, cache=None):
+    if cache is not None and v_idx in cache:
+        return cache[v_idx]
+    video_dirs = _discover_video_dirs(ycbv_dir)
+    raw = YcbVideoReader(video_dirs[v_idx], zfar=1.5)
+    r = _YcbReader(raw, dataset_dir=video_dirs[v_idx])
+    if cache is not None:
+        cache[v_idx] = r
+    return r
+
+
+# =========================================================
+# Scan all videos and find the reference frame
+# =========================================================
+def _find_ref_frame(ycbv_dir, ob_id, ref_video_idx=-1, ref_frame=-1, cache=None, verbose=True):
+    video_dirs = _discover_video_dirs(ycbv_dir)
+    n = len(video_dirs)
+
+    primary = [ref_video_idx] if 0 <= ref_video_idx < n else []
+    fallback = [i for i in range(n) if i not in primary]
+    candidates = primary + fallback
+
+    if verbose:
+        if primary:
+            print(f"  [scan] Priority scan for video {ref_video_idx}, fallback for others.")
+        else:
+            print(f"  [scan] Scanning all {n} videos.")
+
+    available_videos = []
+    
+    for v_idx in candidates:
+        r = _get_reader(ycbv_dir, v_idx, cache)
+        objs = r.list_obj_ids()
+        video_name = os.path.basename(video_dirs[v_idx])
+
+        if verbose:
+            print(f"  [scan] video {v_idx:02d} (dir={video_name}): objs={objs}")
+
+        frames = r.frames_for_obj(ob_id)
+        if frames:
+            available_videos.append((v_idx, frames))
+            if verbose:
+                print(f"  [scan] video {v_idx:02d} (dir={video_name}): --> Contains ob_id={ob_id}, "
+                      f"total {len(frames)} frames, range [{frames[0]}, {frames[-1]}]")
+
+    if not available_videos:
+        return None
+
+    target_v_idx, target_frames = available_videos[0]
+    target_video_name = os.path.basename(video_dirs[target_v_idx])
+
+    if ref_frame >= 0:
+        if ref_frame in target_frames:
+            if verbose:
+                print(f"  [scan] OK Use specified frame v{target_v_idx} (dir={target_video_name}) f{ref_frame}")
+            return (target_v_idx, ref_frame)
+        else:
+            nearest = min(target_frames, key=lambda f: abs(f - ref_frame))
+            if verbose:
+                print(f"  [scan] OK Specified frame missing, use nearest v{target_v_idx} (dir={target_video_name}) f{nearest}")
+            return (target_v_idx, nearest)
+
+    pick = target_frames[len(target_frames) // 2]
+    if verbose:
+        print(f"  [scan] OK Auto-picked middle frame v{target_v_idx} (dir={target_video_name}) f{pick}")
+    return (target_v_idx, pick)
+
+
+# =========================================================
+# Single-frame inference
+# =========================================================
+def run_inference_worker(reader, i_frame, est, ob_id, device, metrics, model_pts, detect_type="mask"):
+    color = reader.get_color(i_frame)
+    depth = reader.get_depth(i_frame)
+    ob_mask = get_object_mask(reader, i_frame, ob_id, detect_type)
+    
+    if ob_mask is None or ob_mask.sum() < 4:
+        return None, None, None, None, None
+        
+    gt_pose = reader.get_gt_pose(i_frame, ob_id)
+    est.gt_pose = gt_pose
+
+    pred_pose = est.register(K=reader.K, rgb=color, depth=depth, ob_mask=ob_mask, ob_id=ob_id, iteration=5)
+    
+    err_dict = metrics.compute_all_errors(pred_pose, gt_pose, model_pts, ob_id)
+    rot_err, trans_err = metrics.compute_pose_decomposition_error(pred_pose, gt_pose)
+    
+    return pred_pose, gt_pose, err_dict, rot_err, trans_err
+
+
+def _load_ycb_classes(path):
+    if path is None:
+        return DEFAULT_YCB_CLASSES
+    with open(path) as f:
+        raw = yaml.safe_load(f)
+    return {str(k): [int(x) for x in v] for k, v in raw.items()}
+
+
+# =========================================================
+# Pipeline
+# =========================================================
+def run_pipeline(detect_type="mask"):
+    ob_ids = [int(v) for v in opt.ob_ids.split(",") if v.strip()] if opt.ob_ids else [opt.ob_id]
+    multi_ob = len(ob_ids) > 1
+    skip_ref = bool(opt.eval_skip_ref)
+    metric = opt.metric
+    stride = max(1, opt.eval_stride)
+
+    metrics = PoseMetrics(opt.ycbv_dir, metric=metric)
+    ycb_classes = _load_ycb_classes(opt.ycb_classes) if metric == "ycbv" else None
+
+    video_dirs = _discover_video_dirs(opt.ycbv_dir)
+    if not video_dirs:
+        raise SystemExit(f"[pipeline] No videos under {opt.ycbv_dir}/test/")
+
+    print(f"[pipeline] Evaluating {len(video_dirs)} videos, {len(ob_ids)} objects, metric={metric}, crop_ratio={opt.crop_ratio}, stride={stride}")
+
+    reader_cache = {}
+    reader0 = _get_reader(opt.ycbv_dir, 0, reader_cache)
+    print(f"[pipeline] video 0 ob_ids: {_reader_ob_ids(reader0)}")
+
+    est = OneRefPose(scorer=None, refiner=None, ref_data_root=opt.ref_data_root)
+    est.to_device("cuda:0")
+
+    all_errors = {} 
+    all_res = NestDict()
+
+    for i_ob, ob_id in enumerate(ob_ids):
+        print(f"\n========== [obj {i_ob + 1}/{len(ob_ids)}] ob_id={ob_id:02d} ==========")
+
+        ref = _find_ref_frame(opt.ycbv_dir, ob_id, ref_video_idx=opt.ref_video_idx,
+                              ref_frame=opt.ref_frame, cache=reader_cache, verbose=True)
+        if ref is None:
+            print(f"[pipeline] WARNING: All {len(video_dirs)} videos do not contain obj_id={ob_id}")
+            continue
+
+        ref_v_idx, ref_k = ref
+        print("\n" + "="*50)
+        print(f"Selected Reference Frame: Video [{ref_v_idx:02d}] Frame [{ref_k:04d}]")
+        print("="*50 + "\n")
+
+        reader_ref = _get_reader(opt.ycbv_dir, ref_v_idx, reader_cache)
+
+        save_to_disk = bool(opt.save_ref)
+        if opt.save_ref and not opt.ref_data_root:
+            print("[pipeline] WARNING: --save_ref set but --ref_data_root is None; skip")
+            save_to_disk = False
+
+        probe_dir = None
+        if opt.save_ref_probe:
+            probe_dir = os.path.join(opt.save_ref_probe, f"ob{ob_id:02d}") if multi_ob else opt.save_ref_probe
+            os.makedirs(probe_dir, exist_ok=True)
+
+        diam_m = metrics.meta_data[ob_id]["diameter_mm"] / 1000.0
+
+        est.use_frame_as_ref(
+            reader_ref, ref_k, ob_id,
+            is_symmetric=(opt.ref_sym_axis >= 0),
+            symmetry_axis=opt.ref_sym_axis,
+            crop_ratio=opt.crop_ratio,
+            device=opt.ref_device,
+            save_to_disk=save_to_disk,
+            mesh_diameter=diam_m, crop_to_ref=True,
+            probe_dir=probe_dir,
+        )
+        
+        # Save Reference Frame crop
+        save_vis_dir = opt.debug_dir
+        if not save_vis_dir:
+            if opt.save_ref_probe:
+                save_vis_dir = os.path.join(opt.save_ref_probe, f"ob{ob_id:02d}") if multi_ob else opt.save_ref_probe
+            elif opt.ref_data_root:
+                save_vis_dir = os.path.join(opt.ref_data_root, str(ob_id))
+            else:
+                save_vis_dir = "debug_ref_vis"
+        
+        os.makedirs(save_vis_dir, exist_ok=True)
+        abs_save_vis_dir = os.path.abspath(save_vis_dir)
+
+        if est.ref_data is not None and est.ref_data.rgb is not None:
+            crop_rgb = est.ref_data.rgb.detach().cpu().permute(1, 2, 0).numpy().astype(np.uint8)
+            crop_mask = (est.ref_data.xyz_map[2] > 1e-5).cpu().numpy().astype(np.uint8) * 255
+            
+            crop_rgb_path = os.path.join(abs_save_vis_dir, f"ref_ob{ob_id:02d}_v{ref_v_idx:02d}_f{ref_k:04d}_crop_rgb.png")
+            cv2.imwrite(crop_rgb_path, cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2BGR))
+            
+            crop_mask_path = os.path.join(abs_save_vis_dir, f"ref_ob{ob_id:02d}_v{ref_v_idx:02d}_f{ref_k:04d}_crop_mask.png")
+            cv2.imwrite(crop_mask_path, crop_mask)
+            
+            overlay = crop_rgb.copy()
+            overlay[crop_mask > 0] = [0, 255, 0]
+            blended = cv2.addWeighted(overlay, 0.3, crop_rgb, 0.7, 0)
+            crop_overlay_path = os.path.join(abs_save_vis_dir, f"ref_ob{ob_id:02d}_v{ref_v_idx:02d}_f{ref_k:04d}_crop_overlay.png")
+            cv2.imwrite(crop_overlay_path, blended)
+
+        if save_to_disk:
+            print(f"[pipeline] Ref saved -> {os.path.join(opt.ref_data_root, str(ob_id))}")
+        if probe_dir:
+            est.refiner.save_ref_probe_dir = probe_dir
+            est.scorer.save_ref_probe_dir = probe_dir
+
+        model_pts = reader0.get_gt_mesh(ob_id).vertices.copy()
+        
+        if metric == "bop":
+            all_errors[ob_id] = {"add_n": [], "adds_n": [], "selected_n": []}
+        else:
+            all_errors[ob_id] = {"add": [], "adds": []}
+
+        target_seq_count = 0
+        total_eval_frames = 0
+        for v_idx in range(len(video_dirs)):
+            r = _get_reader(opt.ycbv_dir, v_idx, reader_cache)
+            for k in r.frames_for_obj(ob_id):
+                if skip_ref and v_idx == ref_v_idx and k == ref_k:
+                    continue
+                if target_seq_count % stride == 0:
+                    total_eval_frames += 1
+                target_seq_count += 1
+
+        if opt.max_eval_frames > 0:
+            total_eval_frames = min(total_eval_frames, opt.max_eval_frames)
+            print(f"  [eval] Target ob_id={ob_id:02d} limited to {total_eval_frames} frames...")
+        else:
+            print(f"  [eval] Target ob_id={ob_id:02d} appears in {total_eval_frames} eval frames (stride={stride}). Starting...")
+        
+        pbar = tqdm(total=total_eval_frames, desc=f"ob_id={ob_id:02d}", dynamic_ncols=True)
+        evaluated_count = 0
+        n_skipped = 0
+        target_seq_count = 0
+
+        for v_idx in range(len(video_dirs)):
+            if opt.max_eval_frames > 0 and evaluated_count >= opt.max_eval_frames:
+                break
+                
+            r = _get_reader(opt.ycbv_dir, v_idx, reader_cache)
+            n_frames = len(r.color_files)
+            
+            for k in range(n_frames):
+                if ob_id not in r.get_instance_ids_in_image(k):
+                    continue
+                if opt.max_eval_frames > 0 and evaluated_count >= opt.max_eval_frames:
+                    break
+                    
+                if skip_ref and v_idx == ref_v_idx and k == ref_k:
+                    n_skipped += 1
+                    continue
+
+                if target_seq_count % stride != 0:
+                    target_seq_count += 1
+                    continue
+                
+                target_seq_count += 1
+                pbar.set_postfix({"v": f"{v_idx:02d}", "f": f"{k:04d}"})
+                
+                try:
+                    pred_pose, gt_pose, err_dict, rot_err, trans_err = run_inference_worker(
+                        r, k, est, ob_id, "cuda:0", metrics, model_pts, detect_type)
+                except Exception as e:
+                    evaluated_count += 1
+                    pbar.update(1)
+                    continue
+                
+                if err_dict is None:
+                    evaluated_count += 1
+                    pbar.update(1)
+                    continue
+                
+                if metric == "bop":
+                    all_errors[ob_id]["add_n"].append(err_dict["add_n"])
+                    all_errors[ob_id]["adds_n"].append(err_dict["adds_n"])
+                    all_errors[ob_id]["selected_n"].append(err_dict["selected_n"])
+                else:
+                    all_errors[ob_id]["add"].append(err_dict["add_m"])
+                    all_errors[ob_id]["adds"].append(err_dict["adds_m"])
+                               
+                all_res[r.get_video_id()][r.id_strs[k]][ob_id] = pred_pose
+                evaluated_count += 1
+                pbar.update(1)
+
+        pbar.close()
+
+        if metric == "bop":
+            errs = np.array(all_errors[ob_id]["selected_n"])
+        else:
+            errs = np.array(all_errors[ob_id]["adds"])
+
+        if len(errs) == 0:
+            print(f"[pipeline] WARNING: no valid eval frames for ob_id={ob_id}")
+            continue
+            
+        if opt.debug_dir:
+            np.savetxt(os.path.join(opt.debug_dir, f"errors_ob{ob_id:02d}.txt"), errs, fmt="%.6f")
+
+    if metric == "bop":
+        _finalize_bop(all_errors, metrics)
+    else:
+        _finalize_ycbv(all_errors, ycb_classes)
+
+    if opt.debug_dir:
+        os.makedirs(opt.debug_dir, exist_ok=True)
+        with open(os.path.join(opt.debug_dir, "ycbv_res.yml"), "w") as f:
+            yaml.safe_dump(make_yaml_dumpable(all_res), f)
+        print(f"\n[pipeline] Final results saved to {opt.debug_dir}")
+
+
+def _finalize_bop(all_errors, metrics):
+    print("\n========== BOP (ADD / ADD-S, normalized by diameter) ==========")
+    if not all_errors:
+        print("(no results)")
+        return
+
+    per_obj_add, per_obj_adds, per_obj_sel = [], [], []
+    
+    for ob_id, v in sorted(all_errors.items()):
+        if not v["selected_n"]:
+            continue
+            
+        add_n = np.asarray(v["add_n"])
+        adds_n = np.asarray(v["adds_n"])
+        sel_n = np.asarray(v["selected_n"])
+        has_sym = metrics.meta_data[ob_id]["has_symmetry"]
+
+        a_add = compute_auc(add_n, max_val=0.1) * 100.0
+        a_adds = compute_auc(adds_n, max_val=0.1) * 100.0
+        a_sel = compute_auc(sel_n, max_val=0.1) * 100.0
+
+        per_obj_add.append(a_add)
+        per_obj_adds.append(a_adds)
+        per_obj_sel.append(a_sel)
+        
+        print(f"\n========== [Object {ob_id:02d}] ==========")
+        print(f" n_evaluated:        {len(sel_n)}")
+        print(f" sym (has_symmetry): {'Y' if has_sym else '-'}")
+        print(f" ADD AUC@0.1d:       {a_add:.2f}")
+        print(f" ADD-S AUC@0.1d:     {a_adds:.2f}")
+        print(f" ADD(-S) AUC@0.1d:   {a_sel:.2f}  (Selected: {'ADD-S' if has_sym else 'ADD'})")
+
+    if per_obj_sel:
+        print(f"\n========== [OVERALL MEAN] ==========")
+        print(f" Objects:            {len(per_obj_sel)} (per-object equal weight)")
+        print(f" ADD AUC@0.1d:       {np.mean(per_obj_add):.2f}")
+        print(f" ADD-S AUC@0.1d:     {np.mean(per_obj_adds):.2f}")
+        print(f" ADD(-S) AUC@0.1d:   {np.mean(per_obj_sel):.2f}")
+
+
+def _finalize_ycbv(all_errors, ycb_classes):
+    print("\n========== YCB-Video (PoseCNN, meters, 5-class mean) ==========")
+    if not all_errors:
+        print("(no results)")
+        return
+
+    per_obj = {}
+    for ob_id, d in sorted(all_errors.items()):
+        if not d["adds"]:
+            continue
+        adds = np.asarray(d["adds"])
+        add = np.asarray(d["add"])
+        per_obj[ob_id] = {
+            "n": len(adds),
+            "adds_auc": compute_auc(adds, max_val=0.1) * 100.0,
+            "add_auc": compute_auc(add, max_val=0.1) * 100.0,
+        }
+
+    assigned = set()
+    print(f"\n{'class':>10} {'n_obj':>6} {'n_eval':>8} {'ADD-S AUC':>12} {'ADD AUC':>10}")
+    cls_adds, cls_add = [], []
+    
+    for cls_name in ["can", "box", "bottles", "blocks", "others"]:
+        ids = [i for i in ycb_classes.get(cls_name, []) if i in per_obj]
+        if not ids:
+            continue
+        assigned.update(ids)
+        a = float(np.mean([per_obj[i]["adds_auc"] for i in ids]))
+        b = float(np.mean([per_obj[i]["add_auc"] for i in ids]))
+        n = int(sum(per_obj[i]["n"] for i in ids))
+        cls_adds.append(a)
+        cls_add.append(b)
+        print(f"{cls_name:>10} {len(ids):>6} {n:>8} {a:>12.2f} {b:>10.2f}")
+
+    unassigned = sorted(set(per_obj.keys()) - assigned)
+    if unassigned:
+        print(f"\n[WARN] Objects not in any class (excluded from 5-class mean): {unassigned}")
+        for i in unassigned:
+            print(f"  ob{i:02d}: n={per_obj[i]['n']} "
+                  f"ADD-S AUC={per_obj[i]['adds_auc']:.2f} ADD AUC={per_obj[i]['add_auc']:.2f}")
+
+    if cls_adds:
+        print("-" * 52)
+        print(f"{'MEAN':>10} {'':>6} {'':>8} {np.mean(cls_adds):>12.2f} {np.mean(cls_add):>10.2f}")
+        print(f"Classes: {len(cls_adds)} (5-class equal weight, matches Table 2)")
+
+    if per_obj:
+        add_s_flat = float(np.mean([v["adds_auc"] for v in per_obj.values()]))
+        add_flat = float(np.mean([v["add_auc"] for v in per_obj.values()]))
+        print(f"\n[reference] per-object equal weight: "
+              f"ADD-S AUC={add_s_flat:.2f} ADD AUC={add_flat:.2f}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ycbv_dir", type=str, required=True)
+    parser.add_argument("--ob_id", type=int, default=1)
+    parser.add_argument("--ob_ids", type=str, default=None)
+    parser.add_argument("--ref_video_idx", type=int, default=-1)
+    parser.add_argument("--ref_frame", type=int, default=-1)
+    
+    parser.add_argument("--eval_skip_ref", action="store_true", default=True)
+    parser.add_argument("--eval_include_ref", dest="eval_skip_ref", action="store_false")
+    parser.add_argument("--eval_stride", type=int, default=1)
+    
+    parser.add_argument("--ref_data_root", type=str, default=None)
+    parser.add_argument("--save_ref", action="store_true")
+    parser.add_argument("--save_ref_probe", type=str, default=None)
+    parser.add_argument("--ref_sym_axis", type=int, default=-1)
+    parser.add_argument("--ref_device", type=str, default="cuda")
+    
+    parser.add_argument("--metric", type=str, default="bop", choices=["bop", "ycbv"])
+    parser.add_argument("--ycb_classes", type=str, default=None)
+    
+    parser.add_argument("--detect_type", type=str, default="mask", choices=["mask", "box"])
+    parser.add_argument("--debug_dir", type=str, default="")
+    parser.add_argument("--crop_ratio", type=float, default=1.2)
+    parser.add_argument("--max_eval_frames", type=int, default=0)
+
+    opt = parser.parse_args()
+    set_seed(0)
+
+    start = time.time()
+    run_pipeline(detect_type=opt.detect_type)
+    print(f"\n[pipeline] Total wall time: {time.time() - start:.2f}s")

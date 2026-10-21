@@ -1,0 +1,15 @@
+ob_id: 1
+crop_ratio: 1.2
+xyz_map.shape: (3, 160, 160)
+rgb.shape: (3, 160, 160)
+pose: ob_in_cam (4x4)
+meta:
+{
+  "crop_ratio": 1.2,
+  "is_symmetric": false,
+  "symmetry_axis": -1,
+  "source_frame": 5,
+  "ob_id": 1,
+  "crop_to_ref": true,
+  "depth_preproc": "erode2+bilateral2+depth2xyzmap+mask"
+}
