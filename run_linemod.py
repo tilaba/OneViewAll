@@ -64,6 +64,11 @@ class PoseMetrics:
         diameter = self.meta_data[ob_id]["diameter"] / 1000
         return self.compute_add_error(pred, gt, model_pts, diameter)
 
+    # --- 新增 ADD-S 计算 ---
+    def compute_adds_success_0_1d(self, pred, gt, model_pts, ob_id):
+        diameter = self.meta_data[ob_id]["diameter"] / 1000
+        return self.compute_adds_error(pred, gt, model_pts, diameter)
+
     def compute_pose_decomposition_error(self, pred, gt):
         R1, R2 = pred[:3, :3], gt[:3, :3]
         t1, t2 = pred[:3, 3], gt[:3, 3]
@@ -109,6 +114,7 @@ def run_inference_worker(
     metrics=None,
     model_pts=None,
     error_dict=None,
+    adds_error_dict=None,  # 新增参数
 ):
     torch.cuda.set_device(device)
     est.to_device(device)
@@ -116,7 +122,6 @@ def run_inference_worker(
     result = NestDict()
 
     for i_frame in i_frames:
-
         color = reader.get_color(i_frame)
         depth = reader.get_depth(i_frame)
         ob_mask = get_object_mask(reader, i_frame, ob_id, detect_type)
@@ -142,11 +147,16 @@ def run_inference_worker(
             pred_pose, gt_pose, model_pts, ob_id
         )
 
+        adds_err = metrics.compute_adds_success_0_1d(
+            pred_pose, gt_pose, model_pts, ob_id
+        )
+
         rot_err, trans_err = metrics.compute_pose_decomposition_error(
             pred_pose, gt_pose
         )
 
         error_dict[ob_id].append(add_err)
+        adds_error_dict[ob_id].append(adds_err)  # 记录 ADD-S
 
         # ---------------- OUTPUT ----------------
         print(f"\n[Frame {i_frame} | Object {ob_id}]")
@@ -155,13 +165,14 @@ def run_inference_worker(
 
         print(
             f"ADD(-S): {add_err:.6f} | "
+            f"ADD-S: {adds_err:.6f} | "
             f"Rot: {rot_err:.2f} deg | "
             f"Trans: {trans_err * 1000:.2f} mm"
         )
 
         result[reader.get_video_id()][reader.id_strs[i_frame]][ob_id] = pred_pose
 
-    return result, error_dict
+    return result, error_dict, adds_error_dict
 
 
 # =========================================================
@@ -174,12 +185,13 @@ def compute_auc_sklearn(errs, max_val=0.1, step=0.001):
     X = np.arange(0, max_val + step, step)
     Y = np.zeros_like(X)
 
+    i = 0
     for i, x in enumerate(X):
         Y[i] = (errs <= x).mean()
         if Y[i] >= 1:
             break
 
-    return metrics.auc(X, Y) / max_val
+    return metrics.auc(X[: i + 1], Y[: i + 1]) / max_val
 
 
 # =========================================================
@@ -188,6 +200,7 @@ def compute_auc_sklearn(errs, max_val=0.1, step=0.001):
 def run_pipeline():
     manager = multiprocessing.Manager()
     error_dict = manager.dict()
+    adds_error_dict = manager.dict()  # 新增 Manager.dict()
 
     reader_tmp = LinemodReader(f"{opt.linemod_dir}/test/000002")
     metrics = PoseMetrics(opt.linemod_dir)
@@ -205,9 +218,11 @@ def run_pipeline():
     res = NestDict()
 
     # ---------------- objects ----------------
-    # for ob_id in reader_tmp.ob_ids:
-    for ob_id in [14]:
+    for ob_id in reader_tmp.ob_ids:
+        # if (ob_id != 10):
+        #     continue
         error_dict[ob_id] = manager.list()
+        adds_error_dict[ob_id] = manager.list()  # 初始化
 
         # ALWAYS use GT mesh (reconstructed removed)
         mesh = reader_tmp.get_gt_mesh(ob_id)
@@ -221,7 +236,7 @@ def run_pipeline():
         reader = LinemodReader(f"{opt.linemod_dir}/test/{ob_id:06d}")
 
         for i in range(len(reader.color_files)):
-            out, error_dict = run_inference_worker(
+            out, error_dict, adds_error_dict = run_inference_worker(
                 reader,
                 [i],
                 est,
@@ -230,23 +245,51 @@ def run_pipeline():
                 metrics,
                 mesh.vertices.copy(),
                 error_dict,
+                adds_error_dict,
             )
 
             for v in out:
                 for s in out[v]:
                     res[v][s][ob_id] = out[v][s][ob_id]
 
+        # ---- per-object 单行结果 ----
+        obj_errs = np.array(list(error_dict[ob_id]))
+        obj_adds_errs = np.array(list(adds_error_dict[ob_id]))
+        if len(obj_errs) > 0:
+            auc_obj = compute_auc_sklearn(obj_errs, max_val=0.1)
+            auc_obj_adds = compute_auc_sklearn(obj_adds_errs, max_val=0.1)
+            print(
+                f"object {ob_id:02d}   "
+                f"ADD@0.1: {np.mean(obj_errs <= 0.1):.4f}   "
+                f"ADD-S@0.1: {np.mean(obj_adds_errs <= 0.1):.4f}   "
+                f"Mean: {np.mean(obj_errs):.6f}   "
+                f"AUC: {auc_obj:.4f}"
+            )
+        else:
+            print(f"object {ob_id:02d}   No valid frames.")
+
     # ---------------- final metrics ----------------
     all_errors = []
-    for ob_id in error_dict:
+    all_adds_errors = []
+    for ob_id in sorted(error_dict.keys()):
         all_errors.extend(list(error_dict[ob_id]))
+        all_adds_errors.extend(list(adds_error_dict[ob_id]))
 
     all_errors = np.array(all_errors)
+    all_adds_errors = np.array(all_adds_errors)
 
-    print("\n========== FINAL METRICS ==========")
-    print("Mean:", np.mean(all_errors))
-    print("Median:", np.median(all_errors))
-    print("ADD@0.1:", np.mean(all_errors <= 0.1))
+    if len(all_errors) > 0:
+        auc_all = compute_auc_sklearn(all_errors, max_val=0.1)
+        auc_all_adds = compute_auc_sklearn(all_adds_errors, max_val=0.1)
+        print(
+            f"\nmean       "
+            f"ADD@0.1: {np.mean(all_errors <= 0.1):.4f}   "
+            f"ADD-S@0.1: {np.mean(all_adds_errors <= 0.1):.4f}   "
+            f"Mean: {np.mean(all_errors):.6f}   "
+            f"AUC: {auc_all:.4f}"
+        )
+    else:
+        print("\nmean       No valid frames.")
 
 
 # =========================================================

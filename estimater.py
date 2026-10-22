@@ -27,7 +27,7 @@ class OneRefPose:
         self.ignore_normal_flip = True
 
         self._init_object_geometry(model_pts, model_normals, mesh=mesh)
-        self._build_rotation_hypotheses(min_n_views=20, inplane_step=180)
+        self._build_rotation_hypotheses(min_n_views=40, inplane_step=180)
 
         self.scorer = scorer if scorer is not None else ScorePredictor()
         self.refiner = refiner if refiner is not None else PoseRefinePredictor()
@@ -83,7 +83,7 @@ class OneRefPose:
     def _build_rotation_hypotheses(self, min_n_views=40, inplane_step=60):
         cam_in_obs = sample_views_fibonacci(n_views=min_n_views)
 
-        mask = cam_in_obs[:, 2, 3] >= 0.15 * self.diameter
+        mask = cam_in_obs[:, 2, 3] >= 0.3
         cam_in_obs = cam_in_obs[mask]
 
         rot_grid = []
