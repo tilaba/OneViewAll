@@ -519,7 +519,7 @@ def make_project_data_batch_init(Ref_pose, rgb_r, xyz_map_rs, is_symmetric, symm
 
     K_crop = tf_to_crops @ K_tensor
 
-    is_symmetric = False
+    # is_symmetric = False
 
     if is_symmetric:
         rgb_projA, xyz_projA, _ = process_and_save_pc_data_batched_v2(

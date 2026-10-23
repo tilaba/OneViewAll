@@ -410,7 +410,7 @@ class PoseRefinement:
     return ref_data.to(device)
 
   @torch.inference_mode()
-  def predict(self, rgb, depth, K, ob_in_cams, xyz_map, mesh_diameter=None, iteration=5, ob_id=None):
+  def predict(self, rgb, depth, K, ob_in_cams, xyz_map, mesh_diameter=None, iteration=3, ob_id=None):
     """
     Predict refined pose
     @rgb: image (H,W,3)
@@ -439,8 +439,7 @@ class PoseRefinement:
     trans_normalizer = self.cfg['trans_normalizer']
     if not isinstance(trans_normalizer, float):
       trans_normalizer = torch.as_tensor(list(trans_normalizer), device=device, dtype=torch.float).reshape(1,3) 
-    
-    iteration = 3
+
     render_size = self.cfg['input_resize']
 
     ref_data = self._get_ref_data(ob_id, device)
@@ -512,7 +511,7 @@ class PoseRefinement:
             diff = (xyzA - xyzA0).abs().sum() / mask.sum().float()
             loss = diff.item()
 
-        logging.info(f"Symmetry candidate: is_sym={is_sym}, axis={sym_axis}, loss={loss:.4f}")
+        # logging.info(f"Symmetry candidate: is_sym={is_sym}, axis={sym_axis}, loss={loss:.4f}")
 
         if loss < best_loss:
             best_loss = loss
@@ -528,7 +527,7 @@ class PoseRefinement:
       is_symmetric = best_sym
       symmetry_axis = best_axis
     
-    logging.info(f"ob_id: {ob_id}, Selected symmetry: is_symmetric={is_symmetric}, axis={symmetry_axis} (loss={best_loss:.4f})")
+    # logging.info(f"ob_id: {ob_id}, Selected symmetry: is_symmetric={is_symmetric}, axis={symmetry_axis} (loss={best_loss:.4f})")
     # ==========================================================
 
     # Enter the main optimization loop, applying the detected is_symmetric / symmetry_axis

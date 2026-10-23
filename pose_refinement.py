@@ -62,8 +62,6 @@ def make_project_data_batch_init(Ref_pose, rgb_r, xyz_map_rs, is_symmetric, symm
 
     K_crop = tf_to_crops @ K_tensor
 
-    is_symmetric = False
-
     if is_symmetric:
         rgb_projA, xyz_projA, _ = process_and_save_pc_data_batched_v2(
             symmetry_axis, Ref_xyz_mapA, Ref_rgb_A, xyz_mapBs[0], rgbBs[0],
@@ -158,7 +156,7 @@ class PoseRefinement:
 
     @torch.inference_mode()
     def predict(self, rgb, depth, K, ob_in_cams, xyz_map, mesh_diameter=None,
-                iteration=5, ob_id=None):
+                iteration=3, ob_id=None):
         import logging
         torch.set_default_tensor_type('torch.cuda.FloatTensor')
         tf_to_center = np.eye(4)
@@ -218,9 +216,11 @@ class PoseRefinement:
             is_symmetric = best_loss <= 0.1
             symmetry_axis = best_axis if is_symmetric else -1
             self._sym_cache[sym_key] = (is_symmetric, symmetry_axis)
-            logging.info(f"[refine] ob_id={ob_id} sym={is_symmetric} axis={symmetry_axis} loss={best_loss:.4f}")
+            # logging.info(f"[refine] ob_id={ob_id} sym={is_symmetric} axis={symmetry_axis} loss={best_loss:.4f}")
 
         probe_dir = None
+
+        is_symmetric = False
         if self.save_ref_probe_dir is not None and not self._probe_saved:
             probe_dir = self.save_ref_probe_dir
             print(f"[refine] first iter, will dump probe to {probe_dir}")

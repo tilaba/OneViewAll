@@ -1,9 +1,0 @@
-{
-  "crop_ratio": 1.2,
-  "is_symmetric": false,
-  "symmetry_axis": -1,
-  "source_frame": 10,
-  "ob_id": 1,
-  "crop_to_ref": true,
-  "depth_preproc": "erode2+bilateral2+depth2xyzmap+mask"
-}

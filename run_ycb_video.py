@@ -75,19 +75,20 @@ class PoseMetrics:
     def compute_all_errors(self, pred, gt, model_pts, ob_id):
         add_m = self.add_m(pred, gt, model_pts)
         adds_m = self.adds_m(pred, gt, model_pts)
-        
+
         diam_m = self.meta_data[ob_id]["diameter_mm"] / 1000.0
         add_n = add_m / diam_m
         adds_n = adds_m / diam_m
-        
+
         has_sym = self.meta_data[ob_id]["has_symmetry"]
+        selected_m = adds_m if has_sym else add_m
         selected_n = adds_n if has_sym else add_n
         selected_name = "ADD-S" if has_sym else "ADD"
-        
+
         return {
-            "add_m": add_m, "adds_m": adds_m,
-            "add_n": add_n, "adds_n": adds_n,
-            "selected_n": selected_n, "selected_name": selected_name,
+            "add_m": add_m, "adds_m": adds_m, "selected_m": selected_m,
+            "add_n": add_n, "adds_n": adds_n, "selected_n": selected_n,
+            "selected_name": selected_name,
             "has_symmetry": has_sym,
         }
 
@@ -100,20 +101,23 @@ class PoseMetrics:
 
 def compute_auc(errs, max_val=0.1):
     """
-    Computes Area Under the Accuracy-Threshold Curve (PoseCNN protocol).
-    Mathematically equivalent to trapezoid integration, but O(1) and exact.
-    Formula: AUC = 1/N * sum(1 - min(e_i, T)/T)
+    Area Under the Accuracy-Threshold Curve.
+    AUC = 1/N * sum(max(0, 1 - e_i / T))
     """
     errs = np.asarray(errs)
     if len(errs) == 0:
         return 0.0
-    
-    # clip errors to max threshold (errors > T contribute 0 to the area)
     clipped = np.clip(errs, 0, max_val)
-    
-    # normalized area
     auc = np.mean(1.0 - (clipped / max_val))
     return float(auc)
+
+
+def compute_acc(errs, threshold=0.1):
+    """Fraction (in %) of frames with error < threshold."""
+    errs = np.asarray(errs)
+    if len(errs) == 0:
+        return 0.0
+    return float(np.mean(errs < threshold) * 100.0)
 
 
 # =========================================================
@@ -234,7 +238,7 @@ def _find_ref_frame(ycbv_dir, ob_id, ref_video_idx=-1, ref_frame=-1, cache=None,
             print(f"  [scan] Scanning all {n} videos.")
 
     available_videos = []
-    
+
     for v_idx in candidates:
         r = _get_reader(ycbv_dir, v_idx, cache)
         objs = r.list_obj_ids()
@@ -276,22 +280,37 @@ def _find_ref_frame(ycbv_dir, ob_id, ref_video_idx=-1, ref_frame=-1, cache=None,
 # =========================================================
 # Single-frame inference
 # =========================================================
-def run_inference_worker(reader, i_frame, est, ob_id, device, metrics, model_pts, detect_type="mask"):
+def run_inference_worker(reader, i_frame, est, ob_id, device, metrics, model_pts,
+                         detect_type="mask", current_eval_idx=None, total_eval_frames=None):
     color = reader.get_color(i_frame)
     depth = reader.get_depth(i_frame)
     ob_mask = get_object_mask(reader, i_frame, ob_id, detect_type)
-    
+
     if ob_mask is None or ob_mask.sum() < 4:
         return None, None, None, None, None
-        
+
     gt_pose = reader.get_gt_pose(i_frame, ob_id)
     est.gt_pose = gt_pose
 
     pred_pose = est.register(K=reader.K, rgb=color, depth=depth, ob_mask=ob_mask, ob_id=ob_id, iteration=5)
-    
+
     err_dict = metrics.compute_all_errors(pred_pose, gt_pose, model_pts, ob_id)
     rot_err, trans_err = metrics.compute_pose_decomposition_error(pred_pose, gt_pose)
-    
+
+    add_n = err_dict["add_n"]
+    adds_n = err_dict["adds_n"]
+    selected_n = err_dict["selected_n"]
+    selected_name = err_dict["selected_name"]
+
+    idx_str = f"{current_eval_idx}/{total_eval_frames}" if current_eval_idx is not None else f"{i_frame}"
+
+    print(f"\n[Frame {idx_str} | Video {reader._dataset_dir.split('/')[-1]} | RawFrame {i_frame} | Object {ob_id}]")
+    print("GT Pose:\n", np.round(gt_pose, 8))
+    print("Pred Pose:\n", np.round(pred_pose, 8))
+    print(f"ADD: {add_n:.6f} | ADD-S: {adds_n:.6f} | "
+          f"{selected_name}: {selected_n:.6f} | "
+          f"Rot: {rot_err:.2f} deg | Trans: {trans_err * 1000:.2f} mm")
+
     return pred_pose, gt_pose, err_dict, rot_err, trans_err
 
 
@@ -320,19 +339,22 @@ def run_pipeline(detect_type="mask"):
     if not video_dirs:
         raise SystemExit(f"[pipeline] No videos under {opt.ycbv_dir}/test/")
 
-    print(f"[pipeline] Evaluating {len(video_dirs)} videos, {len(ob_ids)} objects, metric={metric}, crop_ratio={opt.crop_ratio}, stride={stride}")
+    print(f"[pipeline] Evaluating {len(video_dirs)} videos, {len(ob_ids)} objects, "
+          f"metric={metric}, crop_ratio={opt.crop_ratio}, stride={stride}")
 
     reader_cache = {}
     reader0 = _get_reader(opt.ycbv_dir, 0, reader_cache)
     print(f"[pipeline] video 0 ob_ids: {_reader_ob_ids(reader0)}")
 
-    est = OneRefPose(scorer=None, refiner=None, ref_data_root=opt.ref_data_root)
-    est.to_device("cuda:0")
 
-    all_errors = {} 
+
+    all_errors = {}
     all_res = NestDict()
 
     for i_ob, ob_id in enumerate(ob_ids):
+
+        est = OneRefPose(scorer=None, refiner=None, ref_data_root=opt.ref_data_root, ob_id=ob_id)
+        est.to_device("cuda:0")
         print(f"\n========== [obj {i_ob + 1}/{len(ob_ids)}] ob_id={ob_id:02d} ==========")
 
         ref = _find_ref_frame(opt.ycbv_dir, ob_id, ref_video_idx=opt.ref_video_idx,
@@ -362,7 +384,7 @@ def run_pipeline(detect_type="mask"):
 
         est.use_frame_as_ref(
             reader_ref, ref_k, ob_id,
-            is_symmetric=(opt.ref_sym_axis >= 0),
+            is_symmetric=False,
             symmetry_axis=opt.ref_sym_axis,
             crop_ratio=opt.crop_ratio,
             device=opt.ref_device,
@@ -370,8 +392,7 @@ def run_pipeline(detect_type="mask"):
             mesh_diameter=diam_m, crop_to_ref=True,
             probe_dir=probe_dir,
         )
-        
-        # Save Reference Frame crop
+
         save_vis_dir = opt.debug_dir
         if not save_vis_dir:
             if opt.save_ref_probe:
@@ -380,20 +401,20 @@ def run_pipeline(detect_type="mask"):
                 save_vis_dir = os.path.join(opt.ref_data_root, str(ob_id))
             else:
                 save_vis_dir = "debug_ref_vis"
-        
+
         os.makedirs(save_vis_dir, exist_ok=True)
         abs_save_vis_dir = os.path.abspath(save_vis_dir)
 
         if est.ref_data is not None and est.ref_data.rgb is not None:
             crop_rgb = est.ref_data.rgb.detach().cpu().permute(1, 2, 0).numpy().astype(np.uint8)
             crop_mask = (est.ref_data.xyz_map[2] > 1e-5).cpu().numpy().astype(np.uint8) * 255
-            
+
             crop_rgb_path = os.path.join(abs_save_vis_dir, f"ref_ob{ob_id:02d}_v{ref_v_idx:02d}_f{ref_k:04d}_crop_rgb.png")
             cv2.imwrite(crop_rgb_path, cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2BGR))
-            
+
             crop_mask_path = os.path.join(abs_save_vis_dir, f"ref_ob{ob_id:02d}_v{ref_v_idx:02d}_f{ref_k:04d}_crop_mask.png")
             cv2.imwrite(crop_mask_path, crop_mask)
-            
+
             overlay = crop_rgb.copy()
             overlay[crop_mask > 0] = [0, 255, 0]
             blended = cv2.addWeighted(overlay, 0.3, crop_rgb, 0.7, 0)
@@ -407,9 +428,12 @@ def run_pipeline(detect_type="mask"):
             est.scorer.save_ref_probe_dir = probe_dir
 
         model_pts = reader0.get_gt_mesh(ob_id).vertices.copy()
-        
+
+        # 只存米制误差，10 cm 口径
         if metric == "bop":
-            all_errors[ob_id] = {"add_n": [], "adds_n": [], "selected_n": []}
+            all_errors[ob_id] = {
+                "add_m": [], "adds_m": [], "selected_m": [],
+            }
         else:
             all_errors[ob_id] = {"add": [], "adds": []}
 
@@ -429,7 +453,7 @@ def run_pipeline(detect_type="mask"):
             print(f"  [eval] Target ob_id={ob_id:02d} limited to {total_eval_frames} frames...")
         else:
             print(f"  [eval] Target ob_id={ob_id:02d} appears in {total_eval_frames} eval frames (stride={stride}). Starting...")
-        
+
         pbar = tqdm(total=total_eval_frames, desc=f"ob_id={ob_id:02d}", dynamic_ncols=True)
         evaluated_count = 0
         n_skipped = 0
@@ -438,16 +462,16 @@ def run_pipeline(detect_type="mask"):
         for v_idx in range(len(video_dirs)):
             if opt.max_eval_frames > 0 and evaluated_count >= opt.max_eval_frames:
                 break
-                
+
             r = _get_reader(opt.ycbv_dir, v_idx, reader_cache)
             n_frames = len(r.color_files)
-            
+
             for k in range(n_frames):
                 if ob_id not in r.get_instance_ids_in_image(k):
                     continue
                 if opt.max_eval_frames > 0 and evaluated_count >= opt.max_eval_frames:
                     break
-                    
+
                 if skip_ref and v_idx == ref_v_idx and k == ref_k:
                     n_skipped += 1
                     continue
@@ -455,31 +479,33 @@ def run_pipeline(detect_type="mask"):
                 if target_seq_count % stride != 0:
                     target_seq_count += 1
                     continue
-                
+
                 target_seq_count += 1
                 pbar.set_postfix({"v": f"{v_idx:02d}", "f": f"{k:04d}"})
-                
+
                 try:
                     pred_pose, gt_pose, err_dict, rot_err, trans_err = run_inference_worker(
-                        r, k, est, ob_id, "cuda:0", metrics, model_pts, detect_type)
+                        r, k, est, ob_id, "cuda:0", metrics, model_pts, detect_type,
+                        current_eval_idx=evaluated_count + 1, total_eval_frames=total_eval_frames
+                    )
                 except Exception as e:
                     evaluated_count += 1
                     pbar.update(1)
                     continue
-                
+
                 if err_dict is None:
                     evaluated_count += 1
                     pbar.update(1)
                     continue
-                
+
                 if metric == "bop":
-                    all_errors[ob_id]["add_n"].append(err_dict["add_n"])
-                    all_errors[ob_id]["adds_n"].append(err_dict["adds_n"])
-                    all_errors[ob_id]["selected_n"].append(err_dict["selected_n"])
+                    all_errors[ob_id]["add_m"].append(err_dict["add_m"])
+                    all_errors[ob_id]["adds_m"].append(err_dict["adds_m"])
+                    all_errors[ob_id]["selected_m"].append(err_dict["selected_m"])
                 else:
                     all_errors[ob_id]["add"].append(err_dict["add_m"])
                     all_errors[ob_id]["adds"].append(err_dict["adds_m"])
-                               
+
                 all_res[r.get_video_id()][r.id_strs[k]][ob_id] = pred_pose
                 evaluated_count += 1
                 pbar.update(1)
@@ -487,14 +513,14 @@ def run_pipeline(detect_type="mask"):
         pbar.close()
 
         if metric == "bop":
-            errs = np.array(all_errors[ob_id]["selected_n"])
+            errs = np.array(all_errors[ob_id]["selected_m"])
         else:
             errs = np.array(all_errors[ob_id]["adds"])
 
         if len(errs) == 0:
             print(f"[pipeline] WARNING: no valid eval frames for ob_id={ob_id}")
             continue
-            
+
         if opt.debug_dir:
             np.savetxt(os.path.join(opt.debug_dir, f"errors_ob{ob_id:02d}.txt"), errs, fmt="%.6f")
 
@@ -511,47 +537,67 @@ def run_pipeline(detect_type="mask"):
 
 
 def _finalize_bop(all_errors, metrics):
-    print("\n========== BOP (ADD / ADD-S, normalized by diameter) ==========")
+    """
+    按 PoseCNN YCB-Video 口径：AUC / Acc 阈值 = 10 cm（米制）。
+    """
+    print("\n========== BOP evaluation (threshold = 10 cm, PoseCNN YCB-Video protocol) ==========")
     if not all_errors:
         print("(no results)")
         return
 
-    per_obj_add, per_obj_adds, per_obj_sel = [], [], []
-    
+    per_obj = []
+
     for ob_id, v in sorted(all_errors.items()):
-        if not v["selected_n"]:
+        if not v["selected_m"]:
             continue
-            
-        add_n = np.asarray(v["add_n"])
-        adds_n = np.asarray(v["adds_n"])
-        sel_n = np.asarray(v["selected_n"])
+
+        add_m = np.asarray(v["add_m"])
+        adds_m = np.asarray(v["adds_m"])
+        sel_m = np.asarray(v["selected_m"])
         has_sym = metrics.meta_data[ob_id]["has_symmetry"]
 
-        a_add = compute_auc(add_n, max_val=0.1) * 100.0
-        a_adds = compute_auc(adds_n, max_val=0.1) * 100.0
-        a_sel = compute_auc(sel_n, max_val=0.1) * 100.0
+        a_add = compute_auc(add_m, max_val=0.1) * 100.0
+        a_adds = compute_auc(adds_m, max_val=0.1) * 100.0
+        a_sel = compute_auc(sel_m, max_val=0.1) * 100.0
 
-        per_obj_add.append(a_add)
-        per_obj_adds.append(a_adds)
-        per_obj_sel.append(a_sel)
-        
+        acc_add = compute_acc(add_m, threshold=0.1)
+        acc_adds = compute_acc(adds_m, threshold=0.1)
+        acc_sel = compute_acc(sel_m, threshold=0.1)
+
+        per_obj.append({
+            "ob_id": ob_id,
+            "n": len(sel_m),
+            "has_sym": has_sym,
+            "add_auc": a_add, "adds_auc": a_adds, "sel_auc": a_sel,
+            "add_acc": acc_add, "adds_acc": acc_adds, "sel_acc": acc_sel,
+        })
+
         print(f"\n========== [Object {ob_id:02d}] ==========")
-        print(f" n_evaluated:        {len(sel_n)}")
+        print(f" n_evaluated:        {len(sel_m)}")
         print(f" sym (has_symmetry): {'Y' if has_sym else '-'}")
-        print(f" ADD AUC@0.1d:       {a_add:.2f}")
-        print(f" ADD-S AUC@0.1d:     {a_adds:.2f}")
-        print(f" ADD(-S) AUC@0.1d:   {a_sel:.2f}  (Selected: {'ADD-S' if has_sym else 'ADD'})")
+        print(f"   ADD AUC:          {a_add:.2f}    ADD@10cm:     {acc_add:.2f}%")
+        print(f"   ADD-S AUC:        {a_adds:.2f}    ADD-S@10cm:   {acc_adds:.2f}%")
+        print(f"   ADD(-S) AUC:      {a_sel:.2f}    ADD(-S)@10cm: {acc_sel:.2f}%  "
+              f"(Selected: {'ADD-S' if has_sym else 'ADD'})")
 
-    if per_obj_sel:
-        print(f"\n========== [OVERALL MEAN] ==========")
-        print(f" Objects:            {len(per_obj_sel)} (per-object equal weight)")
-        print(f" ADD AUC@0.1d:       {np.mean(per_obj_add):.2f}")
-        print(f" ADD-S AUC@0.1d:     {np.mean(per_obj_adds):.2f}")
-        print(f" ADD(-S) AUC@0.1d:   {np.mean(per_obj_sel):.2f}")
+    if not per_obj:
+        return
+
+    def _mean(key):
+        return float(np.mean([p[key] for p in per_obj]))
+
+    print(f"\n========== [OVERALL MEAN] ==========")
+    print(f" Objects:            {len(per_obj)} (per-object equal weight)")
+    print(f"   ADD AUC:          {_mean('add_auc'):.2f}    ADD@10cm:     {_mean('add_acc'):.2f}%")
+    print(f"   ADD-S AUC:        {_mean('adds_auc'):.2f}    ADD-S@10cm:   {_mean('adds_acc'):.2f}%")
+    print(f"   ADD(-S) AUC:      {_mean('sel_auc'):.2f}    ADD(-S)@10cm: {_mean('sel_acc'):.2f}%")
 
 
 def _finalize_ycbv(all_errors, ycb_classes):
-    print("\n========== YCB-Video (PoseCNN, meters, 5-class mean) ==========")
+    """
+    YCB-Video 5-class mean，阈值 10 cm（米制），和 PoseCNN Table II 对齐。
+    """
+    print("\n========== YCB-Video (PoseCNN, meters, threshold=10 cm, 5-class mean) ==========")
     if not all_errors:
         print("(no results)")
         return
@@ -566,12 +612,16 @@ def _finalize_ycbv(all_errors, ycb_classes):
             "n": len(adds),
             "adds_auc": compute_auc(adds, max_val=0.1) * 100.0,
             "add_auc": compute_auc(add, max_val=0.1) * 100.0,
+            "adds_acc": compute_acc(adds, threshold=0.1),
+            "add_acc": compute_acc(add, threshold=0.1),
         }
 
     assigned = set()
-    print(f"\n{'class':>10} {'n_obj':>6} {'n_eval':>8} {'ADD-S AUC':>12} {'ADD AUC':>10}")
+    print(f"\n{'class':>10} {'n_obj':>6} {'n_eval':>8} "
+          f"{'ADD-S AUC':>12} {'ADD AUC':>10} {'ADD-S@10cm':>12} {'ADD@10cm':>10}")
     cls_adds, cls_add = [], []
-    
+    cls_adds_acc, cls_add_acc = [], []
+
     for cls_name in ["can", "box", "bottles", "blocks", "others"]:
         ids = [i for i in ycb_classes.get(cls_name, []) if i in per_obj]
         if not ids:
@@ -579,28 +629,39 @@ def _finalize_ycbv(all_errors, ycb_classes):
         assigned.update(ids)
         a = float(np.mean([per_obj[i]["adds_auc"] for i in ids]))
         b = float(np.mean([per_obj[i]["add_auc"] for i in ids]))
+        a_acc = float(np.mean([per_obj[i]["adds_acc"] for i in ids]))
+        b_acc = float(np.mean([per_obj[i]["add_acc"] for i in ids]))
         n = int(sum(per_obj[i]["n"] for i in ids))
         cls_adds.append(a)
         cls_add.append(b)
-        print(f"{cls_name:>10} {len(ids):>6} {n:>8} {a:>12.2f} {b:>10.2f}")
+        cls_adds_acc.append(a_acc)
+        cls_add_acc.append(b_acc)
+        print(f"{cls_name:>10} {len(ids):>6} {n:>8} "
+              f"{a:>12.2f} {b:>10.2f} {a_acc:>11.2f}% {b_acc:>9.2f}%")
 
     unassigned = sorted(set(per_obj.keys()) - assigned)
     if unassigned:
         print(f"\n[WARN] Objects not in any class (excluded from 5-class mean): {unassigned}")
         for i in unassigned:
             print(f"  ob{i:02d}: n={per_obj[i]['n']} "
-                  f"ADD-S AUC={per_obj[i]['adds_auc']:.2f} ADD AUC={per_obj[i]['add_auc']:.2f}")
+                  f"ADD-S AUC={per_obj[i]['adds_auc']:.2f} ADD AUC={per_obj[i]['add_auc']:.2f} "
+                  f"ADD-S@10cm={per_obj[i]['adds_acc']:.2f}% ADD@10cm={per_obj[i]['add_acc']:.2f}%")
 
     if cls_adds:
-        print("-" * 52)
-        print(f"{'MEAN':>10} {'':>6} {'':>8} {np.mean(cls_adds):>12.2f} {np.mean(cls_add):>10.2f}")
+        print("-" * 88)
+        print(f"{'MEAN':>10} {'':>6} {'':>8} "
+              f"{np.mean(cls_adds):>12.2f} {np.mean(cls_add):>10.2f} "
+              f"{np.mean(cls_adds_acc):>11.2f}% {np.mean(cls_add_acc):>9.2f}%")
         print(f"Classes: {len(cls_adds)} (5-class equal weight, matches Table 2)")
 
     if per_obj:
         add_s_flat = float(np.mean([v["adds_auc"] for v in per_obj.values()]))
         add_flat = float(np.mean([v["add_auc"] for v in per_obj.values()]))
+        add_s_acc_flat = float(np.mean([v["adds_acc"] for v in per_obj.values()]))
+        add_acc_flat = float(np.mean([v["add_acc"] for v in per_obj.values()]))
         print(f"\n[reference] per-object equal weight: "
-              f"ADD-S AUC={add_s_flat:.2f} ADD AUC={add_flat:.2f}")
+              f"ADD-S AUC={add_s_flat:.2f} ADD AUC={add_flat:.2f} "
+              f"ADD-S@10cm={add_s_acc_flat:.2f}% ADD@10cm={add_acc_flat:.2f}%")
 
 
 if __name__ == "__main__":
@@ -610,23 +671,23 @@ if __name__ == "__main__":
     parser.add_argument("--ob_ids", type=str, default=None)
     parser.add_argument("--ref_video_idx", type=int, default=-1)
     parser.add_argument("--ref_frame", type=int, default=-1)
-    
+
     parser.add_argument("--eval_skip_ref", action="store_true", default=True)
     parser.add_argument("--eval_include_ref", dest="eval_skip_ref", action="store_false")
     parser.add_argument("--eval_stride", type=int, default=1)
-    
+
     parser.add_argument("--ref_data_root", type=str, default=None)
     parser.add_argument("--save_ref", action="store_true")
     parser.add_argument("--save_ref_probe", type=str, default=None)
     parser.add_argument("--ref_sym_axis", type=int, default=-1)
     parser.add_argument("--ref_device", type=str, default="cuda")
-    
+
     parser.add_argument("--metric", type=str, default="bop", choices=["bop", "ycbv"])
     parser.add_argument("--ycb_classes", type=str, default=None)
-    
+
     parser.add_argument("--detect_type", type=str, default="mask", choices=["mask", "box"])
     parser.add_argument("--debug_dir", type=str, default="")
-    parser.add_argument("--crop_ratio", type=float, default=1.2)
+    parser.add_argument("--crop_ratio", type=float, default=1.1)
     parser.add_argument("--max_eval_frames", type=int, default=0)
 
     opt = parser.parse_args()
