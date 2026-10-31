@@ -435,9 +435,11 @@ def make_project_data_batch_init(Ref_pose, rgb_r, xyz_map_rs, is_symmetric, symm
 
 
 class PoseScore:
-  def __init__(self, amp=True, ref_data_root=None):
+  # [PATCH] 新增 score_mode 参数，默认 "topk"（保持原行为）
+  def __init__(self, amp=True, ref_data_root=None, score_mode="topk"):
     self.amp = amp
     self.ref_data_root = ref_data_root
+    self.score_mode = score_mode          # "topk" | "knockout"
     self.ref_data: Optional[RefData] = None
     self.run_name = "2024-01-11-20-02-45"
 
@@ -548,21 +550,30 @@ class PoseScore:
 
     scores = output["score_logit"].float().reshape(-1)
 
-    if len(scores) > 32:
-        topk = max(1, len(scores) // 2)
-        ids = scores.topk(topk).indices
+    # [PATCH] 硬编码分支：选择后处理方式
+    if self.score_mode == "knockout":
+        # NVIDIA 风格：一次全局 argmax，只有 best 位 = 原分 + 100，其余 = 0
+        raw = scores
+        best_id = int(raw.argmax().item())
+        scores = torch.zeros_like(raw)
+        scores[best_id] = raw[best_id] + 100.0
+    else:
+        # OneViewAll 原行为：完整分数谱 + top-k 精排
+        if len(scores) > 32:
+            topk = max(1, len(scores) // 2)
+            ids = scores.topk(topk).indices
 
-        A_sub = A_all[ids]
-        B_sub = B_all[ids]
+            A_sub = A_all[ids]
+            B_sub = B_all[ids]
 
-        with torch.cuda.amp.autocast(dtype=torch.float16):
-            output = self.model(A_sub, B_sub, L=len(A_sub))
+            with torch.cuda.amp.autocast(dtype=torch.float16):
+                output = self.model(A_sub, B_sub, L=len(A_sub))
 
-        scores_sub = output["score_logit"].float().reshape(-1)
+            scores_sub = output["score_logit"].float().reshape(-1)
 
-        scores_new = torch.full_like(scores, -1e9)
-        scores_new[ids] = scores_sub
-        scores = scores_new
+            scores_new = torch.full_like(scores, -1e9)
+            scores_new[ids] = scores_sub
+            scores = scores_new
 
     torch.cuda.empty_cache()
 

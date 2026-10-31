@@ -448,43 +448,40 @@ class PoseRefinement:
     Ref_pose = ref_data.pose
     crop_ratio = ref_data.meta.get("crop_ratio", self.cfg['crop_ratio'])
 
-    configs = [
-        (True, 0),    # Symmetric about the X axis
-        (True, 1),    # Symmetric about the Y axis
-        (True, 2),    # Symmetric about the Z axis
-    ]
+    # ==========================================================
+    # [PATCH] 优先使用 ref_data.meta 中显式声明的对称性；
+    #         若未声明（或声明为非对称/无效），再走自动检测；
+    #         最终把结果写回 ref_data.meta，供 PoseScore 使用。
+    # ==========================================================
+    meta_is_symmetric = ref_data.meta.get("is_symmetric", None)
+    meta_symmetry_axis = ref_data.meta.get("symmetry_axis", None)
 
-    test_pose = Ref_pose.unsqueeze(0)  # [1,4,4]
-    best_loss = float('inf')
-    best_sym = False
-    best_axis = 0
+    if (meta_is_symmetric is True
+            and meta_symmetry_axis is not None
+            and int(meta_symmetry_axis) >= 0):
+        # use_frame_as_ref 显式指定了对称性，直接采用，跳过自动检测
+        is_symmetric = True
+        symmetry_axis = int(meta_symmetry_axis)
+        logging.info(
+            f"ob_id: {ob_id}, symmetry from ref_data.meta (explicit): "
+            f"is_symmetric={is_symmetric}, axis={symmetry_axis}"
+        )
+    else:
+        # 未指定或声明为非对称 -> 走原来的自动检测
+        configs = [
+            (True, 0),    # Symmetric about the X axis
+            (True, 1),    # Symmetric about the Y axis
+            (True, 2),    # Symmetric about the Z axis
+        ]
 
-    # debug_root = f"symmetry_check/ob{ob_id}"
-    # os.makedirs(debug_root, exist_ok=True)
-    # os.makedirs("output_results_2", exist_ok=True)
-    pose_tmp_base = make_project_data_batch_init(
-        Ref_pose, Ref_rgb_A, Ref_xyz_mapA,
-        False, -1,
-        self.cfg.input_resize, 1,            
-        test_pose, rgb_tensor, depth_tensor, K,
-        crop_ratio=crop_ratio,               
-        xyz_map=xyz_map_tensor,
-        cfg=self.cfg,
-        dataset=self.dataset,
-        mesh_diameter=mesh_diameter,
-        iteration_iter=0,
-        ob_id=ob_id
-    )
-    xyzA0 = pose_tmp_base.xyz_mapAs[0]  # [3, H, W]
+        test_pose = Ref_pose.unsqueeze(0)  # [1,4,4]
+        best_loss = float('inf')
+        best_sym = False
+        best_axis = 0
 
-    # As required, use the first two channels of ref_xyzA0 to obtain a mask of shape [H, W]
-    mask = (xyzA0[:2] > 0).any(dim=0)
-
-    # 2. Iterate over the candidate symmetry axes
-    for is_sym, sym_axis in configs:
-        pose_tmp = make_project_data_batch_init(
+        pose_tmp_base = make_project_data_batch_init(
             Ref_pose, Ref_rgb_A, Ref_xyz_mapA,
-            is_sym, sym_axis,
+            False, -1,
             self.cfg.input_resize, 1,            
             test_pose, rgb_tensor, depth_tensor, K,
             crop_ratio=crop_ratio,               
@@ -495,39 +492,70 @@ class PoseRefinement:
             iteration_iter=0,
             ob_id=ob_id
         )
-        rgbA = pose_tmp.rgbAs[0]      # [3, H, W] synthesized render
-        xyzA = pose_tmp.xyz_mapAs[0]  # [3, H, W]
+        xyzA0 = pose_tmp_base.xyz_mapAs[0]  # [3, H, W]
 
-        # Helper: save the rendered image
-        img = rgbA.detach().float()
-        img = (img - img.min()) / (img.max() - img.min() + 1e-6)
-        # vutils.save_image(img, os.path.join("output_results_2", f"rgbA_{ob_id}_{sym_axis}_{is_sym}.png"))
-        
-        if mask.sum() < 10:
-            loss = 10.0
+        # use the first two channels of ref_xyzA0 to obtain a mask of shape [H, W]
+        mask = (xyzA0[:2] > 0).any(dim=0)
+
+        # Iterate over the candidate symmetry axes
+        for is_sym, sym_axis in configs:
+            pose_tmp = make_project_data_batch_init(
+                Ref_pose, Ref_rgb_A, Ref_xyz_mapA,
+                is_sym, sym_axis,
+                self.cfg.input_resize, 1,            
+                test_pose, rgb_tensor, depth_tensor, K,
+                crop_ratio=crop_ratio,               
+                xyz_map=xyz_map_tensor,
+                cfg=self.cfg,
+                dataset=self.dataset,
+                mesh_diameter=mesh_diameter,
+                iteration_iter=0,
+                ob_id=ob_id
+            )
+            rgbA = pose_tmp.rgbAs[0]      # [3, H, W] synthesized render
+            xyzA = pose_tmp.xyz_mapAs[0]  # [3, H, W]
+
+            # Helper: save the rendered image
+            img = rgbA.detach().float()
+            img = (img - img.min()) / (img.max() - img.min() + 1e-6)
+            # vutils.save_image(img, os.path.join("output_results_2", f"rgbA_{ob_id}_{sym_axis}_{is_sym}.png"))
+
+            if mask.sum() < 10:
+                loss = 10.0
+            else:
+                # L1 error within the mask region
+                diff = (xyzA - xyzA0).abs().sum() / mask.sum().float()
+                loss = diff.item()
+
+            if loss < best_loss:
+                best_loss = loss
+                best_sym = is_sym
+                best_axis = sym_axis
+
+        # Select the best symmetry
+        if best_loss > 0.3:
+            is_symmetric = False
+            symmetry_axis = -1
         else:
-            # Compute L1 error strictly within the mask region
-            # (total deviation over the 3 channels / number of valid pixels)
-            diff = (xyzA - xyzA0).abs().sum() / mask.sum().float()
-            loss = diff.item()
+            is_symmetric = best_sym
+            symmetry_axis = best_axis
 
-        # logging.info(f"Symmetry candidate: is_sym={is_sym}, axis={sym_axis}, loss={loss:.4f}")
+        logging.info(
+            f"ob_id: {ob_id}, auto-detected symmetry: "
+            f"is_symmetric={is_symmetric}, axis={symmetry_axis} (loss={best_loss:.4f})"
+        )
 
-        if loss < best_loss:
-            best_loss = loss
-            best_sym = is_sym
-            best_axis = sym_axis
-
-    # 3. Select the best symmetry
-    # if best_loss > 0.01:
-    if best_loss > 0.1:
-      is_symmetric = False
-      symmetry_axis = -1
-    else:
-      is_symmetric = best_sym
-      symmetry_axis = best_axis
-    
-    # logging.info(f"ob_id: {ob_id}, Selected symmetry: is_symmetric={is_symmetric}, axis={symmetry_axis} (loss={best_loss:.4f})")
+    # [PATCH] 无论走哪个分支，都把最终结果写回 ref_data.meta，
+    #         保证 PoseScore.predict() 与本次 refine 使用同一套对称性。
+    #         OneRefPose._inject_ref_data() 注入的是同一个 RefData 对象，
+    #         内存写回即可被 scorer 读到，无需落盘。
+    ref_data.meta["is_symmetric"] = bool(is_symmetric)
+    ref_data.meta["symmetry_axis"] = int(symmetry_axis)
+    logging.info(
+        f"[PoseRefinement] symmetry written back to ref_data.meta: "
+        f"is_symmetric={ref_data.meta['is_symmetric']}, "
+        f"symmetry_axis={ref_data.meta['symmetry_axis']}"
+    )
     # ==========================================================
 
     # Enter the main optimization loop, applying the detected is_symmetric / symmetry_axis
