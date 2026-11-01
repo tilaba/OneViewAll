@@ -687,7 +687,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--detect_type", type=str, default="mask", choices=["mask", "box"])
     parser.add_argument("--debug_dir", type=str, default="")
-    parser.add_argument("--crop_ratio", type=float, default=1.1)
+    parser.add_argument("--crop_ratio", type=float, default=1.2)
     parser.add_argument("--max_eval_frames", type=int, default=0)
 
     opt = parser.parse_args()

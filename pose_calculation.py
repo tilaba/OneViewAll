@@ -123,7 +123,7 @@ class OneRefPose:
         self.scorer = scorer if scorer is not None else PoseScore(ref_data_root=ref_data_root)
         self.refiner = refiner if refiner is not None else PoseRefinement(ref_data_root=ref_data_root)
         self._inject_ref_data()
-        self._build_rotation_hypotheses(min_n_views=20, inplane_step=180)
+        self._build_rotation_hypotheses(min_n_views=60, inplane_step=90)
 
     # ======================================================
     # Reference data plumbing
@@ -275,7 +275,8 @@ class OneRefPose:
     # Rotation hypothesis generation
     # ======================================================
     def _build_rotation_hypotheses(self, min_n_views=40, inplane_step=60):
-        cam_in_obs = sample_views_icosphere(n_views=min_n_views)
+        # cam_in_obs = sample_views_icosphere(n_views=min_n_views)
+        cam_in_obs = sample_views_fibonacci(n_views=min_n_views)
         # cam_in_obs = cam_in_obs[cam_in_obs[:, 2, 3] >= 0.35]
         rot_grid = []
         for i in range(len(cam_in_obs)):
@@ -313,7 +314,7 @@ class OneRefPose:
     # ======================================================
     # Main inference API
     # ======================================================
-    def register(self, K, rgb, depth, ob_mask, ob_id=None, iteration=5):
+    def register(self, K, rgb, depth, ob_mask, ob_id=None, iteration=3):
         depth = erode_depth(depth, radius=2, device="cuda")
         depth = bilateral_filter_depth(depth, radius=2, device="cuda")
 

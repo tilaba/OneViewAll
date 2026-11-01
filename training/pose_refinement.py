@@ -520,14 +520,17 @@ class PoseRefinement:
 
     # 3. Select the best symmetry
     # if best_loss > 0.01:
-    if best_loss > 0.1:
+    if best_loss > 0.3:
       is_symmetric = False
       symmetry_axis = -1
     else:
       is_symmetric = best_sym
       symmetry_axis = best_axis
+
+    is_symmetric = False
+    symmetry_axis = -1
     
-    # logging.info(f"ob_id: {ob_id}, Selected symmetry: is_symmetric={is_symmetric}, axis={symmetry_axis} (loss={best_loss:.4f})")
+    logging.info(f"ob_id: {ob_id}, Selected symmetry: is_symmetric={is_symmetric}, axis={symmetry_axis} (loss={best_loss:.4f})")
     # ==========================================================
 
     # Enter the main optimization loop, applying the detected is_symmetric / symmetry_axis
