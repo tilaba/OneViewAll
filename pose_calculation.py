@@ -314,7 +314,7 @@ class OneRefPose:
     # ======================================================
     # Main inference API
     # ======================================================
-    def register(self, K, rgb, depth, ob_mask, ob_id=None, iteration=3):
+    def register(self, K, rgb, depth, ob_mask, ob_id=None, iteration=5):
         depth = erode_depth(depth, radius=2, device="cuda")
         depth = bilateral_filter_depth(depth, radius=2, device="cuda")
 
